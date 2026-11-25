@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Logout
@@ -27,7 +28,10 @@ import androidx.compose.material.icons.filled.BatterySaver
 import androidx.compose.material.icons.automirrored.filled.BluetoothSearching
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.DarkMode
+import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Translate
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -73,6 +77,7 @@ fun NearbyScreen(
     onSendNearbyPacket: (peerAddress: String, kind: String, payload: String) -> Unit
 ) {
     val strings = stringsFor(language)
+    val context = LocalContext.current
     var selectedPeer by remember(peers) { mutableStateOf(peers.firstOrNull()) }
     var draft by remember { mutableStateOf("") }
 
@@ -109,6 +114,9 @@ fun NearbyScreen(
                                 }
                                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                                     add(Manifest.permission.NEARBY_WIFI_DEVICES)
+                                } else if (!LocationCaptureHelper.hasForegroundLocationPermission(context)) {
+                                    // Android 7-12 requires location permission for Bluetooth / Wi-Fi Direct peer discovery
+                                    add(Manifest.permission.ACCESS_FINE_LOCATION)
                                 }
                             }.toTypedArray()
                             if (needed.isNotEmpty()) permLauncher.launch(needed)
@@ -213,7 +221,11 @@ fun SettingsScreen(
     onSelectTheme: (ThemePreference) -> Unit,
     onSaveTurnConfig: (String, String, String) -> Unit,
     onSyncNow: () -> Unit,
-    onSignOut: () -> Unit
+    onSignOut: () -> Unit,
+    onToggleNetworkMonitoring: (Boolean) -> Unit = {},
+    onSetLocationInterval: (Int) -> Unit = {},
+    onSetLastSeenPrivacy: (String) -> Unit = {},
+    onSetAvailability: (String) -> Unit = {}
 ) {
     val strings = stringsFor(language)
     val context = LocalContext.current
@@ -283,6 +295,106 @@ fun SettingsScreen(
                     )
                     OutlinedButton(onClick = onSyncNow, modifier = Modifier.testTag("settings_sync_now_button")) {
                         Text(strings.syncNowBtn)
+                    }
+                }
+            }
+        }
+
+        // Background Network Activity History & Sync Interval
+        item {
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                            Icon(Icons.Default.Wifi, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                            Spacer(Modifier.width(8.dp))
+                            Column {
+                                Text("Background Network Activity History", style = MaterialTheme.typography.titleMedium)
+                                Text(
+                                    if (settings.networkMonitoringEnabled) "Recording Wi-Fi / Mobile / Internet state changes"
+                                    else "Paused — network transitions not recorded",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                        Switch(
+                            checked = settings.networkMonitoringEnabled,
+                            onCheckedChange = onToggleNetworkMonitoring,
+                            enabled = ownDevice?.revoked != true,
+                            modifier = Modifier.testTag("network_monitoring_switch")
+                        )
+                    }
+                    Text(
+                        "Android Doze & OEM battery savers may delay background checks; offline events sync automatically when Internet resumes.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.Schedule, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Background Sync Interval", style = MaterialTheme.typography.titleSmall)
+                    }
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        items(listOf(15, 30, 60, 120)) { mins ->
+                            FilterChip(
+                                selected = settings.locationIntervalMinutes == mins,
+                                onClick = { onSetLocationInterval(mins) },
+                                label = { Text("${mins}m") },
+                                modifier = Modifier.testTag("interval_chip_$mins")
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // Presence & Privacy
+        item {
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.Visibility, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Presence & Last Seen Privacy", style = MaterialTheme.typography.titleMedium)
+                    }
+                    Text("Who can see your last seen time in chat:", style = MaterialTheme.typography.bodySmall)
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        items(
+                            listOf(
+                                "EVERYONE" to "Everyone",
+                                "ADMIN_ONLY" to "Admin Only",
+                                "NOBODY" to "Nobody"
+                            )
+                        ) { (code, label) ->
+                            FilterChip(
+                                selected = settings.lastSeenPrivacy == code,
+                                onClick = { onSetLastSeenPrivacy(code) },
+                                label = { Text(label) },
+                                modifier = Modifier.testTag("privacy_chip_$code")
+                            )
+                        }
+                    }
+                    Text("My Availability Status:", style = MaterialTheme.typography.bodySmall)
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        items(
+                            listOf(
+                                "AVAILABLE" to "Available",
+                                "BUSY" to "Busy",
+                                "AWAY" to "Away"
+                            )
+                        ) { (code, label) ->
+                            FilterChip(
+                                selected = settings.availability == code,
+                                onClick = { onSetAvailability(code) },
+                                label = { Text(label) },
+                                modifier = Modifier.testTag("availability_chip_$code")
+                            )
+                        }
                     }
                 }
             }

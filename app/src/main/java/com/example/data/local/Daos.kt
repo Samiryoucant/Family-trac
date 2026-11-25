@@ -66,6 +66,12 @@ interface PendingMessageDao {
     @Query("UPDATE pending_messages SET syncAttempts = syncAttempts + 1, lastError = :error WHERE id = :messageId")
     suspend fun markFailed(messageId: String, error: String?)
 
+    @Query("UPDATE pending_messages SET lastError = NULL WHERE id = :messageId")
+    suspend fun clearErrorForRetry(messageId: String)
+
+    @Query("DELETE FROM pending_messages WHERE id = :messageId")
+    suspend fun deleteById(messageId: String)
+
     @Query("DELETE FROM pending_messages WHERE synced = 1 AND clientCreatedAtMs < :cutoffMs")
     suspend fun pruneOldSynced(cutoffMs: Long)
 }
@@ -90,7 +96,7 @@ interface ConsentLogDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(log: ConsentLogEntity)
 
-    @Query("SELECT * FROM consent_logs ORDER BY timestampMs DESC LIMIT 50")
+    @Query("SELECT * FROM consent_logs ORDER BY timestampMs DESC LIMIT 100")
     fun observeLogs(): Flow<List<ConsentLogEntity>>
 }
 
@@ -108,6 +114,60 @@ interface AppNotificationDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(notification: AppNotificationEntity)
 
-    @Query("SELECT * FROM app_notifications ORDER BY createdAtMs DESC LIMIT 50")
+    @Query("SELECT * FROM app_notifications ORDER BY createdAtMs DESC LIMIT 100")
     fun observeAll(): Flow<List<AppNotificationEntity>>
+
+    @Query("UPDATE app_notifications SET seen = 1 WHERE id = :id")
+    suspend fun markSeen(id: String)
+
+    @Query("UPDATE app_notifications SET seen = 1")
+    suspend fun markAllSeen()
+}
+
+@Dao
+interface NetworkEventDao {
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertEvent(event: NetworkEventEntity)
+
+    @Query("SELECT * FROM network_events WHERE synced = 0 ORDER BY detectedAtMs ASC LIMIT 100")
+    suspend fun getPendingBatch(): List<NetworkEventEntity>
+
+    @Query("SELECT * FROM network_events WHERE deviceId = :deviceId ORDER BY detectedAtMs DESC LIMIT 1")
+    suspend fun getLatestForDevice(deviceId: String): NetworkEventEntity?
+
+    @Query("SELECT * FROM network_events ORDER BY detectedAtMs DESC LIMIT 300")
+    fun observeLocalEvents(): Flow<List<NetworkEventEntity>>
+
+    @Query("SELECT COUNT(*) FROM network_events WHERE synced = 0")
+    fun observePendingCount(): Flow<Int>
+
+    @Query("UPDATE network_events SET synced = 1, lastError = NULL WHERE id = :eventId")
+    suspend fun markSynced(eventId: String)
+
+    @Query("UPDATE network_events SET syncAttempts = syncAttempts + 1, lastError = :error WHERE id = :eventId")
+    suspend fun markSyncFailed(eventId: String, error: String?)
+
+    @Query("DELETE FROM network_events WHERE synced = 1 AND detectedAtMs < :cutoffMs")
+    suspend fun pruneSyncedOlderThan(cutoffMs: Long)
+}
+
+@Dao
+interface NetworkSessionDao {
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsert(session: NetworkSessionEntity)
+
+    @Query("SELECT * FROM network_sessions WHERE deviceId = :deviceId AND status = 'ACTIVE' ORDER BY startedAtMs DESC")
+    suspend fun getOpenActiveSessions(deviceId: String): List<NetworkSessionEntity>
+
+    @Query("SELECT * FROM network_sessions WHERE synced = 0 ORDER BY startedAtMs ASC LIMIT 50")
+    suspend fun getPendingSyncSessions(): List<NetworkSessionEntity>
+
+    @Query("SELECT * FROM network_sessions ORDER BY startedAtMs DESC LIMIT 200")
+    fun observeLocalSessions(): Flow<List<NetworkSessionEntity>>
+
+    @Query("UPDATE network_sessions SET synced = 1 WHERE id = :sessionId")
+    suspend fun markSynced(sessionId: String)
+
+    @Query("DELETE FROM network_sessions WHERE synced = 1 AND status != 'ACTIVE' AND startedAtMs < :cutoffMs")
+    suspend fun pruneOldSynced(cutoffMs: Long)
 }

@@ -12,11 +12,17 @@ import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.BatteryManager
 import android.os.Build
+import android.os.CancellationSignal
+import android.os.Looper
 import androidx.core.content.ContextCompat
+import androidx.core.location.LocationManagerCompat
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
 import com.google.android.gms.tasks.CancellationTokenSource
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.coroutines.resume
 import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.pow
@@ -59,47 +65,87 @@ object LocationCaptureHelper {
         val bm = context.getSystemService(Context.BATTERY_SERVICE) as? BatteryManager
         val prop = bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
         if (prop != null && prop in 0..100) return prop
-        val intent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        val intent = runCatching {
+            context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        }.getOrNull()
         val level = intent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
         val scale = intent?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
         return if (level >= 0 && scale > 0) ((level * 100f) / scale).toInt().coerceIn(0, 100) else 100
     }
 
     fun getNetworkType(context: Context): String {
-        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return "OFFLINE"
-        val network = cm.activeNetwork ?: return "OFFLINE"
-        val caps = cm.getNetworkCapabilities(network) ?: return "OFFLINE"
-        return when {
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "WIFI"
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "CELLULAR"
-            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) -> "WIFI"
-            else -> "OFFLINE"
-        }
+        return runCatching {
+            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return "OFFLINE"
+            val network = cm.activeNetwork ?: return "OFFLINE"
+            val caps = cm.getNetworkCapabilities(network) ?: return "OFFLINE"
+            when {
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "WIFI"
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "CELLULAR"
+                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) -> "WIFI"
+                else -> "OFFLINE"
+            }
+        }.getOrDefault("OFFLINE")
     }
 
     @SuppressLint("MissingPermission")
     suspend fun captureBestLocation(context: Context): CapturedLocation? {
         if (!hasForegroundLocationPermission(context)) return null
 
-        // 1. Primary: Google FusedLocationProviderClient (balanced/high accuracy)
-        val fusedResult = runCatching {
-            val client = LocationServices.getFusedLocationProviderClient(context)
+        // 1. Primary: Google FusedLocationProviderClient with 8s timeout (won't hang on older phones)
+        val fusedResult = withTimeoutOrNull(8_000L) {
             val cts = CancellationTokenSource()
-            val loc = client.getCurrentLocation(Priority.PRIORITY_BALANCED_POWER_ACCURACY, cts.token).await()
-                ?: client.lastLocation.await()
-            loc?.toCaptured("FUSED")
-        }.getOrNull()
+            try {
+                runCatching {
+                    val client = LocationServices.getFusedLocationProviderClient(context)
+                    val loc = client.getCurrentLocation(Priority.PRIORITY_BALANCED_POWER_ACCURACY, cts.token).await()
+                        ?: client.lastLocation.await()
+                    loc?.toCaptured("FUSED")
+                }.getOrNull()
+            } finally {
+                cts.cancel()
+            }
+        }
 
         if (fusedResult != null && fusedResult.accuracyMeters <= 250f) {
             return fusedResult
         }
 
-        // 2. Fallback: Android native LocationManager (GPS_PROVIDER / NETWORK_PROVIDER)
+        // 2. Fallback: Android native LocationManager (active single fix + cached GPS/Network for Android 7-15)
         val lm = context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
+        val activeNative = if (lm != null) {
+            val provider = when {
+                runCatching { lm.isProviderEnabled(LocationManager.GPS_PROVIDER) }.getOrDefault(false) -> LocationManager.GPS_PROVIDER
+                runCatching { lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER) }.getOrDefault(false) -> LocationManager.NETWORK_PROVIDER
+                else -> null
+            }
+            if (provider != null) {
+                withTimeoutOrNull(6_000L) {
+                    suspendCancellableCoroutine<CapturedLocation?> { cont ->
+                        val signal = CancellationSignal()
+                        cont.invokeOnCancellation { signal.cancel() }
+                        runCatching {
+                            LocationManagerCompat.getCurrentLocation(
+                                lm,
+                                provider,
+                                signal,
+                                ContextCompat.getMainExecutor(context)
+                            ) { loc ->
+                                if (cont.isActive) {
+                                    cont.resume(loc?.toCaptured("NATIVE_$provider"))
+                                }
+                            }
+                        }.onFailure {
+                            if (cont.isActive) cont.resume(null)
+                        }
+                    }
+                }
+            } else null
+        } else null
+
         val gpsLoc = runCatching { lm?.getLastKnownLocation(LocationManager.GPS_PROVIDER)?.toCaptured("GPS_PROVIDER") }.getOrNull()
         val netLoc = runCatching { lm?.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)?.toCaptured("NETWORK_PROVIDER") }.getOrNull()
 
-        return listOfNotNull(fusedResult, gpsLoc, netLoc)
+        return listOfNotNull(fusedResult, activeNative, gpsLoc, netLoc)
             .filter { it.latitude in -90.0..90.0 && it.longitude in -180.0..180.0 }
             .minByOrNull { it.accuracyMeters }
     }

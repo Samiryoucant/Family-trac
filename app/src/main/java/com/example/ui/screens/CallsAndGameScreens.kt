@@ -4,35 +4,28 @@ import android.Manifest
 import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.CallEnd
-import androidx.compose.material.icons.filled.GridOn
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material.icons.filled.PhoneInTalk
-import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -53,13 +46,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.example.data.model.CallSession
 import com.example.data.model.FamilyMember
-import com.example.data.model.GameSession
 import com.example.service.WebRtcCallState
 import com.example.ui.i18n.stringsFor
 import com.example.ui.theme.MonoFontFamily
@@ -289,154 +279,6 @@ fun CallsScreen(
                     ) {
                         Text(other, style = MaterialTheme.typography.bodyMedium)
                         Text(c.status, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-fun TicTacToeScreen(
-    language: String,
-    currentUserId: String,
-    members: List<FamilyMember>,
-    games: List<GameSession>,
-    selectedGameId: String?,
-    onInviteMember: (FamilyMember) -> Unit,
-    onSelectGame: (String) -> Unit,
-    onMakeMove: (GameSession, Int) -> Unit,
-    onRestartGame: (String) -> Unit
-) {
-    val strings = stringsFor(language)
-    val activeGame = games.firstOrNull { it.id == selectedGameId } ?: games.firstOrNull()
-
-    LazyColumn(
-        modifier = Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
-        item {
-            Text(strings.inviteMemberLabel, style = MaterialTheme.typography.titleMedium)
-            Spacer(Modifier.height(8.dp))
-            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(members.filter { it.uid != currentUserId }, key = { it.uid }) { member ->
-                    FilledTonalButton(
-                        onClick = { onInviteMember(member) },
-                        modifier = Modifier.testTag("invite_ttt_${member.uid}")
-                    ) {
-                        Icon(Icons.Default.GridOn, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(Modifier.width(6.dp))
-                        Text(member.displayName)
-                    }
-                }
-            }
-        }
-
-        if (activeGame != null) {
-            item {
-                val mySymbol = if (activeGame.playerXUid == currentUserId) "X" else "O"
-                val isMyTurn = activeGame.status == "ACTIVE" && activeGame.currentTurn == mySymbol
-                val statusBanner = when (activeGame.status) {
-                    "X_WON" -> if (activeGame.playerXUid == currentUserId) strings.youWonLabel else strings.youLostLabel
-                    "O_WON" -> if (activeGame.playerOUid == currentUserId) strings.youWonLabel else strings.youLostLabel
-                    "DRAW" -> strings.drawLabel
-                    else -> if (isMyTurn) "${strings.yourTurnLabel} ($mySymbol)" else "${strings.opponentTurnLabel} (${activeGame.currentTurn})"
-                }
-
-                Card(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .widthIn(max = 460.dp)
-                ) {
-                    Column(
-                        modifier = Modifier.padding(16.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally
-                    ) {
-                        Text(
-                            "${activeGame.playerXName} (X) vs ${activeGame.playerOName} (O)",
-                            style = MaterialTheme.typography.titleMedium
-                        )
-                        Spacer(Modifier.height(6.dp))
-                        Surface(
-                            color = if (isMyTurn) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
-                            shape = MaterialTheme.shapes.small
-                        ) {
-                            Text(
-                                text = statusBanner,
-                                style = MaterialTheme.typography.labelLarge,
-                                color = if (isMyTurn) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
-                            )
-                        }
-                        Spacer(Modifier.height(16.dp))
-
-                        // 3x3 Board
-                        for (row in 0..2) {
-                            Row(
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                modifier = Modifier.padding(vertical = 4.dp)
-                            ) {
-                                for (col in 0..2) {
-                                    val idx = row * 3 + col
-                                    val cell = activeGame.board.getOrNull(idx).orEmpty()
-                                    Surface(
-                                        shape = MaterialTheme.shapes.medium,
-                                        color = MaterialTheme.colorScheme.surfaceVariant,
-                                        border = BorderStroke(1.5.dp, MaterialTheme.colorScheme.outline),
-                                        modifier = Modifier
-                                            .size(86.dp)
-                                            .aspectRatio(1f)
-                                            .clickable(enabled = isMyTurn && cell.isEmpty()) {
-                                                onMakeMove(activeGame, idx)
-                                            }
-                                            .testTag("ttt_cell_$idx")
-                                    ) {
-                                        Box(contentAlignment = Alignment.Center) {
-                                            Text(
-                                                text = cell,
-                                                fontSize = 32.sp,
-                                                fontWeight = FontWeight.Bold,
-                                                color = if (cell == "X") MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondary
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        if (activeGame.status != "ACTIVE") {
-                            Spacer(Modifier.height(14.dp))
-                            Button(
-                                onClick = { onRestartGame(activeGame.id) },
-                                modifier = Modifier.testTag("restart_ttt_button")
-                            ) {
-                                Icon(Icons.Default.Refresh, contentDescription = strings.restartGameBtn)
-                                Spacer(Modifier.width(6.dp))
-                                Text(strings.restartGameBtn)
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if (games.isNotEmpty()) {
-            item {
-                Text(strings.matchHistoryLabel, style = MaterialTheme.typography.titleMedium)
-            }
-            items(games, key = { it.id }) { g ->
-                Card(
-                    onClick = { onSelectGame(g.id) },
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Row(
-                        modifier = Modifier.padding(12.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text("${g.playerXName} vs ${g.playerOName}", style = MaterialTheme.typography.bodyMedium)
-                        Text(g.status, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
                     }
                 }
             }

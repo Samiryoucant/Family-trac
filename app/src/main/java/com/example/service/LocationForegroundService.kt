@@ -82,14 +82,22 @@ class LocationForegroundService : Service() {
             this,
             "Hourly + movement sync active • Tap Pause anytime"
         )
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NotificationHelper.NOTIF_ID_LOCATION_FGS,
-                notif,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
-            )
-        } else {
-            startForeground(NotificationHelper.NOTIF_ID_LOCATION_FGS, notif)
+        val startedFg = runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    NotificationHelper.NOTIF_ID_LOCATION_FGS,
+                    notif,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+                )
+            } else {
+                startForeground(NotificationHelper.NOTIF_ID_LOCATION_FGS, notif)
+            }
+        }.isSuccess
+
+        if (!startedFg) {
+            Log.w(TAG, "Foreground service start blocked by OS policy; relying on WorkManager sync")
+            stopSelf()
+            return START_NOT_STICKY
         }
 
         startLocationUpdates()
@@ -151,8 +159,8 @@ class LocationForegroundService : Service() {
                         source = captured.source
                     )
                 }
-                // Wait 60 minutes for next scheduled check
-                delay(60L * 60L * 1000L)
+                val intervalMs = settings.locationIntervalMinutes.coerceIn(15, 120) * 60L * 1000L
+                delay(intervalMs)
             }
         }
     }
@@ -180,8 +188,8 @@ class LocationForegroundService : Service() {
         } else {
             Double.MAX_VALUE
         }
-        // Save if >= 50 minutes elapsed OR meaningful movement >= 75m (with 2 min cooldown)
-        if (elapsedMs < 50L * 60L * 1000L && (movedMeters < 75.0 || elapsedMs < 2L * 60L * 1000L)) {
+        val minElapsedMs = (settings.locationIntervalMinutes.coerceIn(15, 120) - 2).coerceAtLeast(10) * 60L * 1000L
+        if (elapsedMs < minElapsedMs && (movedMeters < 75.0 || elapsedMs < 2L * 60L * 1000L)) {
             return
         }
 
@@ -233,15 +241,21 @@ class LocationForegroundService : Service() {
         fun startIfPermitted(context: Context) {
             if (!LocationCaptureHelper.hasForegroundLocationPermission(context)) return
             val intent = Intent(context, LocationForegroundService::class.java)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
+            } catch (e: Exception) {
+                // On Android 12-15 background restrictions, safely fall back to WorkManager sync
+                Log.w(TAG, "Unable to start foreground service: ${e.message}")
+                SyncScheduler.enqueueImmediateLocationSync(context)
             }
         }
 
         fun stop(context: Context) {
-            context.stopService(Intent(context, LocationForegroundService::class.java))
+            runCatching { context.stopService(Intent(context, LocationForegroundService::class.java)) }
         }
     }
 }

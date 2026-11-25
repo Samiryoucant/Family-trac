@@ -3,6 +3,7 @@ package com.example
 import android.content.Context
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.hasScrollToNodeAction
+import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
@@ -253,11 +254,13 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun onboardingRoleUi_switchesBetweenAdminAndFamilyModes() {
+    fun onboardingRoleUi_allowsAdminOnlyForAuthorizedEmail() {
         composeRule.setContent {
             FamilyTrackTheme {
                 OnboardingRoleScreen(
                     language = "en",
+                    allowedAdminEmail = true,
+                    signedInEmail = "quixoratech@gmail.com",
                     isBusy = false,
                     bannerError = null,
                     onClearError = {},
@@ -279,7 +282,61 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun ticTacToeUi_rendersBoardAndTriggersMoveCallback() {
+    fun onboardingRoleUi_hidesAdminCardForNonAdminEmail() {
+        composeRule.setContent {
+            FamilyTrackTheme {
+                OnboardingRoleScreen(
+                    language = "en",
+                    allowedAdminEmail = false,
+                    signedInEmail = "familymember@gmail.com",
+                    isBusy = false,
+                    bannerError = null,
+                    onClearError = {},
+                    onCreateFamily = {},
+                    onJoinFamily = { _, _ -> }
+                )
+            }
+        }
+        composeRule.waitForIdle()
+
+        composeRule.onNodeWithTag("select_admin_role_card").assertDoesNotExist()
+        composeRule.onNodeWithTag("pairing_code_input").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithTag("scan_qr_button").performScrollTo().assertIsDisplayed()
+    }
+
+    @Test
+    fun ticTacToeEngine_evaluates3x3_4x4_andHardAiBlocksOrWins() {
+        val win3 = com.example.game.TicTacToeEngine.evaluate(
+            listOf("X", "X", "X", "", "O", "", "O", "", ""),
+            com.example.game.BoardSize.CLASSIC_3X3
+        )
+        assertEquals("X_WON", win3.status)
+        assertEquals(listOf(0, 1, 2), win3.winningIndices)
+
+        val win4 = com.example.game.TicTacToeEngine.evaluate(
+            listOf(
+                "O", "", "", "",
+                "", "O", "", "",
+                "", "", "O", "",
+                "", "", "", "O"
+            ),
+            com.example.game.BoardSize.PRO_4X4
+        )
+        assertEquals("O_WON", win4.status)
+        assertEquals(listOf(0, 5, 10, 15), win4.winningIndices)
+
+        // Hard AI must block immediate human win at index 2
+        val move = com.example.game.TicTacToeEngine.pickAiMove(
+            board = listOf("X", "X", "", "", "O", "", "", "", ""),
+            boardSize = com.example.game.BoardSize.CLASSIC_3X3,
+            aiSymbol = "O",
+            difficulty = com.example.game.AiDifficulty.HARD
+        )
+        assertEquals(2, move)
+    }
+
+    @Test
+    fun ticTacToeUi_rendersOnlineAndLocalModesCorrectly() {
         var movedIndex = -1
         val game = GameSession(
             id = "game_1",
@@ -312,5 +369,18 @@ class ExampleRobolectricTest {
         composeRule.waitForIdle()
         composeRule.onNodeWithTag("ttt_cell_4").performClick()
         assertEquals(4, movedIndex)
+
+        // Switch to Pass & Play and choose 4x4 Pro board
+        composeRule.onNodeWithTag("ttt_mode_pass_and_play").performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("ttt_size_4x4").performClick()
+        composeRule.waitForIdle()
+        composeRule.onNode(hasTestTag("ttt_cell_15"), useUnmergedTree = true).performScrollTo().assertIsDisplayed()
+
+        // Switch to Solo vs Smart AI
+        composeRule.onNodeWithTag("ttt_mode_solo_ai").performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("ttt_diff_hard").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithTag("ttt_side_o").performScrollTo().assertIsDisplayed()
     }
 }

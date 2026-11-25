@@ -1,10 +1,12 @@
 package com.example.ui.viewmodel
 
 import android.content.Context
+import android.net.Uri
 import android.util.Base64
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.data.local.AppNotificationEntity
 import com.example.data.local.AppPreferences
 import com.example.data.local.CachedDeviceEntity
 import com.example.data.local.ConsentLogEntity
@@ -16,21 +18,32 @@ import com.example.data.local.SyncStatusEntity
 import com.example.data.model.CallSession
 import com.example.data.model.ChatMessage
 import com.example.data.model.Conversation
+import com.example.data.model.FamilyCalendarEvent
+import com.example.data.model.FamilyExpense
 import com.example.data.model.FamilyGroup
 import com.example.data.model.FamilyMember
+import com.example.data.model.FamilyNotice
+import com.example.data.model.FamilyNotificationModel
+import com.example.data.model.FamilyTask
+import com.example.data.model.FamilyVaultFile
 import com.example.data.model.GameSession
 import com.example.data.model.LocationRecord
+import com.example.data.model.NetworkEventModel
+import com.example.data.model.NetworkSessionModel
 import com.example.data.model.PairedDevice
 import com.example.data.model.PairingCode
 import com.example.data.model.UserProfile
 import com.example.data.remote.CommunicationRepository
+import com.example.data.remote.FamilyHubRepository
 import com.example.data.remote.FamilyRepository
 import com.example.data.remote.unwrapFirestoreError
 import com.example.service.LocationCaptureHelper
 import com.example.service.LocationForegroundService
+import com.example.service.MediaAndExportHelper
 import com.example.service.NearbyCommunicationManager
 import com.example.service.NearbyPacket
 import com.example.service.NearbyPeer
+import com.example.service.NetworkActivityMonitor
 import com.example.service.NotificationHelper
 import com.example.service.SyncScheduler
 import com.example.service.VoiceRecorderPlayer
@@ -68,14 +81,18 @@ sealed interface UiState<out T> {
 class MainViewModel(
     private val appContext: Context,
     val currentUserId: String,
+    val currentUserEmail: String,
     private val familyRepo: FamilyRepository,
     private val commRepo: CommunicationRepository,
     private val prefs: AppPreferences,
     private val localDb: FamilyTrackDatabase,
     val voiceRecorderPlayer: VoiceRecorderPlayer,
     val webRtcManager: WebRtcCallManager,
-    val nearbyManager: NearbyCommunicationManager
+    val nearbyManager: NearbyCommunicationManager,
+    private val hubRepo: FamilyHubRepository = FamilyHubRepository(appContext)
 ) : ViewModel() {
+
+    val isAllowedAdminEmail: Boolean = currentUserEmail.trim().lowercase() == AUTHORIZED_ADMIN_EMAIL
 
     val localSettings: StateFlow<LocalAppSettings> = prefs.settingsFlow
         .stateIn(viewModelScope, SharingStarted.Eagerly, LocalAppSettings())
@@ -103,7 +120,7 @@ class MainViewModel(
         .stateIn(viewModelScope, SharingStarted.Eagerly, null)
 
     val isBackendAdmin: StateFlow<Boolean> = activeFamily
-        .map { it != null && it.adminUid == currentUserId }
+        .map { it != null && it.adminUid == currentUserId && isAllowedAdminEmail }
         .stateIn(viewModelScope, SharingStarted.Eagerly, false)
 
     val familyMembers: StateFlow<List<FamilyMember>> = activeFamily
@@ -121,7 +138,7 @@ class MainViewModel(
 
     val adminDevices: StateFlow<List<PairedDevice>> = activeFamily
         .flatMapLatest { fam ->
-            if (fam == null || fam.adminUid != currentUserId) flowOf(emptyList())
+            if (fam == null || fam.adminUid != currentUserId || !isAllowedAdminEmail) flowOf(emptyList())
             else familyRepo.observeAdminDevices(fam.id, currentUserId)
                 .catch { err ->
                     unwrapFirestoreError(err)
@@ -197,7 +214,7 @@ class MainViewModel(
 
     val sevenDayLocations: StateFlow<List<LocationRecord>> = activeFamily
         .flatMapLatest { fam ->
-            if (fam == null || fam.adminUid != currentUserId) flowOf(emptyList())
+            if (fam == null || fam.adminUid != currentUserId || !isAllowedAdminEmail) flowOf(emptyList())
             else familyRepo.observeSevenDayLocationHistory(fam.id, currentUserId)
                 .catch { err ->
                     unwrapFirestoreError(err)
@@ -205,6 +222,147 @@ class MainViewModel(
                 }
         }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000L), emptyList())
+
+    private val cloudNetworkEvents: StateFlow<List<NetworkEventModel>> = activeFamily
+        .flatMapLatest { fam ->
+            if (fam == null || fam.adminUid != currentUserId || !isAllowedAdminEmail) flowOf(emptyList())
+            else hubRepo.observeAdminNetworkEvents(fam.id, currentUserId)
+                .catch { err ->
+                    unwrapFirestoreError(err)
+                    emit(emptyList())
+                }
+        }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000L), emptyList())
+
+    val networkEvents: StateFlow<List<NetworkEventModel>> = combine(
+        isBackendAdmin,
+        cloudNetworkEvents,
+        localDb.networkEventDao().observeLocalEvents()
+    ) { admin, cloud, local ->
+        if (!admin) emptyList()
+        else {
+            val localMapped = local.map { e ->
+                NetworkEventModel(
+                    id = e.id,
+                    familyId = e.familyId,
+                    adminUid = e.adminUid,
+                    ownerUid = e.ownerUid,
+                    deviceId = e.deviceId,
+                    deviceName = e.deviceName,
+                    eventType = e.eventType,
+                    networkType = e.networkType,
+                    connectionState = e.connectionState,
+                    internetAvailable = e.internetAvailable,
+                    eventTimestampMs = e.eventTimestampMs,
+                    detectedAtMs = e.detectedAtMs,
+                    timezoneId = e.timezoneId,
+                    timezoneOffsetMinutes = e.timezoneOffsetMinutes.toLong(),
+                    sessionId = e.sessionId,
+                    details = e.details
+                )
+            }
+            (cloud + localMapped).distinctBy { it.id }.sortedByDescending { it.detectedAtMs }
+        }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000L), emptyList())
+
+    private val cloudNetworkSessions: StateFlow<List<NetworkSessionModel>> = activeFamily
+        .flatMapLatest { fam ->
+            if (fam == null || fam.adminUid != currentUserId || !isAllowedAdminEmail) flowOf(emptyList())
+            else hubRepo.observeAdminNetworkSessions(fam.id, currentUserId)
+                .catch { err ->
+                    unwrapFirestoreError(err)
+                    emit(emptyList())
+                }
+        }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000L), emptyList())
+
+    val networkSessions: StateFlow<List<NetworkSessionModel>> = combine(
+        isBackendAdmin,
+        cloudNetworkSessions,
+        localDb.networkSessionDao().observeLocalSessions()
+    ) { admin, cloud, local ->
+        if (!admin) emptyList()
+        else {
+            val localMapped = local.map { s ->
+                NetworkSessionModel(
+                    id = s.id,
+                    familyId = s.familyId,
+                    adminUid = s.adminUid,
+                    ownerUid = s.ownerUid,
+                    deviceId = s.deviceId,
+                    deviceName = s.deviceName,
+                    networkType = s.networkType,
+                    startedAtMs = s.startedAtMs,
+                    endedAtMs = s.endedAtMs,
+                    durationMs = s.durationMs,
+                    status = s.status,
+                    lastVerifiedAtMs = s.lastVerifiedAtMs,
+                    interruptionReason = s.interruptionReason,
+                    timezoneId = s.timezoneId
+                )
+            }
+            (cloud + localMapped).distinctBy { it.id }.sortedByDescending { it.startedAtMs }
+        }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000L), emptyList())
+
+    val calendarEvents: StateFlow<List<FamilyCalendarEvent>> = activeFamily
+        .map { it?.id.orEmpty() }
+        .distinctUntilChanged()
+        .flatMapLatest { famId ->
+            if (famId.isBlank()) flowOf(emptyList())
+            else hubRepo.observeCalendarEvents(famId).catch { emit(emptyList()) }
+        }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000L), emptyList())
+
+    val tasks: StateFlow<List<FamilyTask>> = activeFamily
+        .map { it?.id.orEmpty() }
+        .distinctUntilChanged()
+        .flatMapLatest { famId ->
+            if (famId.isBlank()) flowOf(emptyList())
+            else hubRepo.observeTasks(famId).catch { emit(emptyList()) }
+        }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000L), emptyList())
+
+    val expenses: StateFlow<List<FamilyExpense>> = activeFamily
+        .map { it?.id.orEmpty() }
+        .distinctUntilChanged()
+        .flatMapLatest { famId ->
+            if (famId.isBlank()) flowOf(emptyList())
+            else hubRepo.observeExpenses(famId).catch { emit(emptyList()) }
+        }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000L), emptyList())
+
+    val notices: StateFlow<List<FamilyNotice>> = activeFamily
+        .map { it?.id.orEmpty() }
+        .distinctUntilChanged()
+        .flatMapLatest { famId ->
+            if (famId.isBlank()) flowOf(emptyList())
+            else hubRepo.observeNotices(famId).catch { emit(emptyList()) }
+        }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000L), emptyList())
+
+    val vaultFiles: StateFlow<List<FamilyVaultFile>> = combine(activeFamily, isBackendAdmin) { fam, admin ->
+        fam?.id.orEmpty() to admin
+    }.flatMapLatest { (famId, admin) ->
+        if (famId.isBlank()) flowOf(emptyList())
+        else hubRepo.observeVaultFiles(famId, currentUserId, admin).catch { emit(emptyList()) }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000L), emptyList())
+
+    val cloudNotifications: StateFlow<List<FamilyNotificationModel>> = activeFamily
+        .map { it?.id.orEmpty() }
+        .distinctUntilChanged()
+        .flatMapLatest { famId ->
+            if (famId.isBlank()) flowOf(emptyList())
+            else hubRepo.observeNotifications(famId, currentUserId).catch { emit(emptyList()) }
+        }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000L), emptyList())
+
+    val localNotifications: StateFlow<List<AppNotificationEntity>> = localDb.appNotificationDao().observeAll()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000L), emptyList())
+
+    val unreadNotificationCount: StateFlow<Int> = combine(cloudNotifications, localNotifications) { cloud, local ->
+        cloud.count { !it.seen } + local.count { !it.seen }
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000L), 0)
 
     val pendingLocationCount: StateFlow<Int> = localDb.locationRecordDao().observePendingCount()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000L), 0)
@@ -233,6 +391,9 @@ class MainViewModel(
 
     private val _selectedConversationId = MutableStateFlow("conv_group")
     val selectedConversationId: StateFlow<String> = _selectedConversationId.asStateFlow()
+
+    private val _replyingToMessage = MutableStateFlow<ChatMessage?>(null)
+    val replyingToMessage: StateFlow<ChatMessage?> = _replyingToMessage.asStateFlow()
 
     val activeMessages: StateFlow<List<ChatMessage>> = combine(activeFamily, _selectedConversationId) { fam, convId ->
         fam?.id.orEmpty() to convId
@@ -314,19 +475,28 @@ class MainViewModel(
     private val seenIceIds = mutableSetOf<String>()
     private var lastNotifiedCallId: String? = null
     private var lastNotifiedMessageId: String? = null
+    private var lastTypingSentAtMs: Long = 0L
 
     init {
         viewModelScope.launch {
             prefs.getOrCreateDeviceId()
         }
-        // Keep DataStore pairing metadata & Group chat membership synced when family loads
+        // Keep DataStore pairing metadata, presence, network monitor & Group chat membership synced when family loads
         viewModelScope.launch {
             activeFamily.collect { fam ->
                 if (fam != null) {
-                    val role = if (fam.adminUid == currentUserId) "ADMIN" else "FAMILY"
+                    val role = if (fam.adminUid == currentUserId && isAllowedAdminEmail) "ADMIN" else "FAMILY"
                     prefs.setSessionPairing(role = role, familyId = fam.id, adminUid = fam.adminUid)
                     familyRepo.ensureGroupConversationMember(fam.id, fam.memberUids)
-                    SyncScheduler.schedulePeriodicSync(appContext)
+                    val cur = localSettings.value
+                    SyncScheduler.schedulePeriodicSync(appContext, intervalMinutes = cur.locationIntervalMinutes)
+                    NetworkActivityMonitor.startMonitoringIfConsented(appContext)
+                    familyRepo.updateMemberPresence(
+                        familyId = fam.id,
+                        online = true,
+                        lastSeenPrivacy = cur.lastSeenPrivacy,
+                        availability = cur.availability
+                    )
                 }
             }
         }
@@ -415,21 +585,44 @@ class MainViewModel(
                 }
             }
         }
-        // Observe incoming messages for notifications & read receipts
+        // Observe incoming messages for notifications, inbox log & read/delivery receipts
         viewModelScope.launch {
             activeMessages.collect { msgs ->
+                val famId = activeFamily.value?.id ?: return@collect
+                for (m in msgs.takeLast(12)) {
+                    if (m.senderUid != currentUserId && !m.deliveredToUids.contains(currentUserId)) {
+                        commRepo.markMessageDelivered(famId, m.conversationId, m.id)
+                    }
+                }
                 val latest = msgs.lastOrNull()
                 if (latest != null && latest.senderUid != currentUserId && latest.id != lastNotifiedMessageId) {
                     lastNotifiedMessageId = latest.id
                     if (!latest.readByUids.contains(currentUserId)) {
+                        val preview = when (latest.type) {
+                            "VOICE" -> "Sent a voice message"
+                            "IMAGE" -> "Sent a photo"
+                            "DOCUMENT" -> "Shared ${latest.fileName ?: "a document"}"
+                            else -> latest.text.take(120)
+                        }
                         NotificationHelper.showAlertNotification(
                             appContext,
                             NotificationHelper.CHANNEL_MESSAGES,
                             2002,
                             latest.senderName,
-                            if (latest.type == "VOICE") "Sent a voice message" else latest.text.take(120)
+                            preview
                         )
-                        val famId = activeFamily.value?.id ?: return@collect
+                        localDb.appNotificationDao().insert(
+                            AppNotificationEntity(
+                                id = "msg_${latest.id}",
+                                title = "Message from ${latest.senderName}",
+                                body = preview,
+                                type = "MESSAGE",
+                                createdAtMs = latest.clientCreatedAtMs,
+                                seen = false,
+                                familyId = famId,
+                                category = "MESSAGE"
+                            )
+                        )
                         commRepo.markMessageRead(famId, latest.conversationId, latest.id)
                     }
                 }
@@ -464,6 +657,10 @@ class MainViewModel(
 
     // --- ONBOARDING & PAIRING ---
     fun createFamilyAsAdmin(familyName: String) {
+        if (!isAllowedAdminEmail) {
+            _actionBanner.value = "Admin Mode is restricted to $AUTHORIZED_ADMIN_EMAIL. Please join using Family Mode."
+            return
+        }
         viewModelScope.launch {
             _isBusy.value = true
             val deviceId = prefs.getOrCreateDeviceId()
@@ -502,25 +699,118 @@ class MainViewModel(
         }
     }
 
-    fun grantConsentAndEnableSharing() {
+    fun setLastSeenPrivacy(privacy: String) {
+        viewModelScope.launch {
+            prefs.setLastSeenPrivacy(privacy)
+            val role = if (isBackendAdmin.value) "ADMIN" else "FAMILY"
+            familyRepo.upsertUserProfile(role = role, language = localSettings.value.language, lastSeenPrivacy = privacy)
+            activeFamily.value?.let { fam ->
+                familyRepo.updateMemberPresence(fam.id, online = true, lastSeenPrivacy = privacy)
+            }
+        }
+    }
+
+    fun setAvailability(availability: String) {
+        viewModelScope.launch {
+            prefs.setAvailability(availability)
+            activeFamily.value?.let { fam ->
+                familyRepo.updateMemberPresence(fam.id, online = true, availability = availability)
+            }
+        }
+    }
+
+    fun setLocationIntervalMinutes(minutes: Int) {
+        viewModelScope.launch {
+            prefs.setLocationIntervalMinutes(minutes)
+            SyncScheduler.schedulePeriodicSync(appContext, intervalMinutes = minutes, replace = true)
+            _actionBanner.value = "Sync interval updated to every $minutes min."
+        }
+    }
+
+    fun toggleNetworkMonitoring(enable: Boolean) {
         viewModelScope.launch {
             val fam = activeFamily.value ?: return@launch
             val deviceId = prefs.getOrCreateDeviceId()
-            prefs.setConsentAndSharing(consentGranted = true, sharingEnabled = true)
-            _pendingConsentAfterJoin.value = false
-
+            prefs.setNetworkMonitoringConsent(consentGranted = enable, enabled = enable)
             localDb.consentLogDao().insert(
                 ConsentLogEntity(
                     id = UUID.randomUUID().toString(),
                     userId = currentUserId,
                     familyId = fam.id,
                     deviceId = deviceId,
-                    action = "GRANTED",
-                    details = "Explicit user consent granted for location & telemetry sharing",
+                    action = if (enable) "NETWORK_GRANTED" else "NETWORK_PAUSED",
+                    details = if (enable) "User enabled consent-based network activity monitoring" else "User paused network activity monitoring",
                     timestampMs = System.currentTimeMillis()
                 )
             )
-            LocationForegroundService.startIfPermitted(appContext)
+            if (enable) {
+                NetworkActivityMonitor.startMonitoringIfConsented(appContext)
+                SyncScheduler.enqueueImmediateNetworkSync(appContext)
+            } else {
+                NetworkActivityMonitor.stopMonitoring(appContext, logPauseEvent = true)
+                SyncScheduler.enqueueImmediateNetworkSync(appContext)
+            }
+            val snap = NetworkActivityMonitor.currentSnapshot()
+            val netType = LocationCaptureHelper.getNetworkType(appContext)
+            familyRepo.updateOwnDeviceStatus(
+                familyId = fam.id,
+                deviceId = deviceId,
+                consentGranted = localSettings.value.consentGranted,
+                locationSharingEnabled = localSettings.value.locationSharingEnabled,
+                locationPermissionGranted = LocationCaptureHelper.hasForegroundLocationPermission(appContext),
+                backgroundPermissionGranted = LocationCaptureHelper.hasBackgroundLocationPermission(appContext),
+                batteryPercent = LocationCaptureHelper.getBatteryPercent(appContext),
+                networkType = netType,
+                online = netType != "OFFLINE",
+                networkConsentGranted = enable,
+                networkMonitoringEnabled = enable,
+                currentWifiAvailable = snap.wifiAvailable,
+                currentCellularAvailable = snap.cellularAvailable,
+                internetAvailable = snap.internetAvailable
+            )
+        }
+    }
+
+    fun grantConsentAndEnableSharing() {
+        grantConsentAndEnableSharing(enableLocation = true, enableNetwork = true)
+    }
+
+    fun grantConsentAndEnableSharing(enableLocation: Boolean = true, enableNetwork: Boolean = true) {
+        viewModelScope.launch {
+            val fam = activeFamily.value ?: return@launch
+            val deviceId = prefs.getOrCreateDeviceId()
+            prefs.setConsentAndSharing(consentGranted = enableLocation, sharingEnabled = enableLocation)
+            prefs.setNetworkMonitoringConsent(consentGranted = enableNetwork, enabled = enableNetwork)
+            _pendingConsentAfterJoin.value = false
+
+            if (enableLocation) {
+                localDb.consentLogDao().insert(
+                    ConsentLogEntity(
+                        id = UUID.randomUUID().toString(),
+                        userId = currentUserId,
+                        familyId = fam.id,
+                        deviceId = deviceId,
+                        action = "GRANTED",
+                        details = "Explicit user consent granted for location & telemetry sharing",
+                        timestampMs = System.currentTimeMillis()
+                    )
+                )
+                LocationForegroundService.startIfPermitted(appContext)
+            }
+            if (enableNetwork) {
+                localDb.consentLogDao().insert(
+                    ConsentLogEntity(
+                        id = UUID.randomUUID().toString(),
+                        userId = currentUserId,
+                        familyId = fam.id,
+                        deviceId = deviceId,
+                        action = "NETWORK_GRANTED",
+                        details = "Explicit user consent granted for network connectivity history",
+                        timestampMs = System.currentTimeMillis()
+                    )
+                )
+                NetworkActivityMonitor.startMonitoringIfConsented(appContext)
+            }
             captureLocationAndQueueSync()
         }
     }
@@ -542,7 +832,9 @@ class MainViewModel(
                     backgroundPermissionGranted = LocationCaptureHelper.hasBackgroundLocationPermission(appContext),
                     batteryPercent = LocationCaptureHelper.getBatteryPercent(appContext),
                     networkType = LocationCaptureHelper.getNetworkType(appContext),
-                    online = LocationCaptureHelper.getNetworkType(appContext) != "OFFLINE"
+                    online = LocationCaptureHelper.getNetworkType(appContext) != "OFFLINE",
+                    networkConsentGranted = localSettings.value.networkMonitoringConsent,
+                    networkMonitoringEnabled = localSettings.value.networkMonitoringEnabled
                 )
             }
         }
@@ -582,7 +874,9 @@ class MainViewModel(
                     backgroundPermissionGranted = LocationCaptureHelper.hasBackgroundLocationPermission(appContext),
                     batteryPercent = LocationCaptureHelper.getBatteryPercent(appContext),
                     networkType = LocationCaptureHelper.getNetworkType(appContext),
-                    online = LocationCaptureHelper.getNetworkType(appContext) != "OFFLINE"
+                    online = LocationCaptureHelper.getNetworkType(appContext) != "OFFLINE",
+                    networkConsentGranted = localSettings.value.networkMonitoringConsent,
+                    networkMonitoringEnabled = localSettings.value.networkMonitoringEnabled
                 )
             }
         }
@@ -652,20 +946,43 @@ class MainViewModel(
     }
 
     fun revokeDevice(deviceId: String) {
+        setDevicePausedOrRevoked(deviceId, revoked = true)
+    }
+
+    fun setDevicePausedOrRevoked(deviceId: String, revoked: Boolean) {
         viewModelScope.launch {
             val fam = activeFamily.value ?: return@launch
-            val res = familyRepo.revokeDevice(fam.id, deviceId)
+            val res = familyRepo.setDeviceRevoked(fam.id, deviceId, revoked)
             res.onSuccess {
-                _actionBanner.value = "Device access revoked."
+                _actionBanner.value = if (revoked) "Device access paused/revoked." else "Device access restored."
             }.onFailure { err ->
-                _actionBanner.value = err.localizedMessage ?: "Failed to revoke device"
+                _actionBanner.value = err.localizedMessage ?: "Failed to update device"
             }
         }
     }
 
-    // --- MESSAGING & VOICE NOTES ---
+    fun renamePairedDevice(deviceId: String, newName: String) {
+        viewModelScope.launch {
+            val fam = activeFamily.value ?: return@launch
+            val res = familyRepo.renameDevice(fam.id, deviceId, newName)
+            res.onSuccess { _actionBanner.value = "Device renamed." }
+                .onFailure { _actionBanner.value = it.localizedMessage ?: "Rename failed" }
+        }
+    }
+
+    fun removePairedDevice(deviceId: String) {
+        viewModelScope.launch {
+            val fam = activeFamily.value ?: return@launch
+            val res = familyRepo.removeDevice(fam.id, deviceId)
+            res.onSuccess { _actionBanner.value = "Device removed." }
+                .onFailure { _actionBanner.value = it.localizedMessage ?: "Remove failed" }
+        }
+    }
+
+    // --- WHATSAPP-STYLE MESSENGER ---
     fun selectConversation(conversationId: String) {
         _selectedConversationId.value = conversationId
+        _replyingToMessage.value = null
     }
 
     fun openDirectChat(member: FamilyMember) {
@@ -675,15 +992,38 @@ class MainViewModel(
             val res = commRepo.getOrCreateDirectConversation(fam.id, member.uid, member.displayName, myName)
             res.onSuccess { convId ->
                 _selectedConversationId.value = convId
+                _replyingToMessage.value = null
             }.onFailure { err ->
                 _actionBanner.value = err.localizedMessage ?: "Could not open chat"
             }
         }
     }
 
+    fun setReplyTarget(msg: ChatMessage?) {
+        _replyingToMessage.value = msg
+    }
+
+    fun onChatTypingStateChanged(isTyping: Boolean, activity: String = "TYPING") {
+        val fam = activeFamily.value ?: return
+        val convId = _selectedConversationId.value
+        val now = System.currentTimeMillis()
+        if (isTyping && now - lastTypingSentAtMs < 3_000L) return
+        lastTypingSentAtMs = if (isTyping) now else 0L
+        viewModelScope.launch {
+            familyRepo.updateMemberPresence(
+                familyId = fam.id,
+                online = true,
+                typingConversationId = convId,
+                typingActivity = if (isTyping) activity else "NONE"
+            )
+        }
+    }
+
     fun sendTextMessage(text: String) {
         val clean = text.trim()
         if (clean.isBlank()) return
+        val replyTarget = _replyingToMessage.value
+        _replyingToMessage.value = null
         viewModelScope.launch {
             val fam = activeFamily.value ?: return@launch
             val convId = _selectedConversationId.value
@@ -692,8 +1032,8 @@ class MainViewModel(
             val senderName = Firebase.auth.currentUser?.displayName ?: "Family Member"
             val messageId = UUID.randomUUID().toString()
             val nowMs = System.currentTimeMillis()
+            val replyPreview = replyTarget?.let { "${it.senderName}: ${it.text.take(70)}" }
 
-            // Save locally in Room queue first for offline safety
             localDb.pendingMessageDao().insertPending(
                 PendingMessageEntity(
                     id = messageId,
@@ -704,6 +1044,8 @@ class MainViewModel(
                     participantUidsCsv = participants.joinToString(","),
                     type = "TEXT",
                     text = clean,
+                    replyToMessageId = replyTarget?.id,
+                    replyToPreview = replyPreview,
                     clientCreatedAtMs = nowMs,
                     synced = false
                 )
@@ -717,17 +1059,23 @@ class MainViewModel(
                 participantUids = participants,
                 type = "TEXT",
                 text = clean,
+                replyToMessageId = replyTarget?.id,
+                replyToPreview = replyPreview,
                 clientCreatedAtMs = nowMs
             )
             if (res.isSuccess) {
                 localDb.pendingMessageDao().markSynced(messageId)
+                familyRepo.updateMemberPresence(fam.id, online = true, typingConversationId = convId, typingActivity = "NONE")
             } else {
+                localDb.pendingMessageDao().markFailed(messageId, res.exceptionOrNull()?.message)
                 SyncScheduler.enqueueImmediateCommsSync(appContext)
             }
         }
     }
 
     fun sendVoiceNote(file: File, durationMs: Long) {
+        val replyTarget = _replyingToMessage.value
+        _replyingToMessage.value = null
         viewModelScope.launch {
             val fam = activeFamily.value ?: return@launch
             val convId = _selectedConversationId.value
@@ -736,6 +1084,7 @@ class MainViewModel(
             val senderName = Firebase.auth.currentUser?.displayName ?: "Family Member"
             val messageId = UUID.randomUUID().toString()
             val nowMs = System.currentTimeMillis()
+            val replyPreview = replyTarget?.let { "${it.senderName}: ${it.text.take(70)}" }
 
             localDb.pendingMessageDao().insertPending(
                 PendingMessageEntity(
@@ -749,6 +1098,8 @@ class MainViewModel(
                     text = "Voice note (${durationMs / 1000L}s)",
                     voiceFilePath = file.absolutePath,
                     voiceDurationMs = durationMs,
+                    replyToMessageId = replyTarget?.id,
+                    replyToPreview = replyPreview,
                     clientCreatedAtMs = nowMs,
                     synced = false
                 )
@@ -759,6 +1110,7 @@ class MainViewModel(
             }.getOrNull()
 
             if (base64 == null) {
+                localDb.pendingMessageDao().markFailed(messageId, "Voice note exceeded 400 KB limit")
                 _actionBanner.value = "Voice note exceeded size limit."
                 return@launch
             }
@@ -773,14 +1125,183 @@ class MainViewModel(
                 text = "Voice note (${durationMs / 1000L}s)",
                 voiceAudioBase64 = base64,
                 voiceDurationMs = durationMs,
+                replyToMessageId = replyTarget?.id,
+                replyToPreview = replyPreview,
                 clientCreatedAtMs = nowMs
             )
             if (res.isSuccess) {
                 localDb.pendingMessageDao().markSynced(messageId)
             } else {
+                localDb.pendingMessageDao().markFailed(messageId, res.exceptionOrNull()?.message)
                 SyncScheduler.enqueueImmediateCommsSync(appContext)
             }
         }
+    }
+
+    fun sendImageAttachment(uri: Uri, caption: String = "") {
+        val replyTarget = _replyingToMessage.value
+        _replyingToMessage.value = null
+        viewModelScope.launch {
+            val fam = activeFamily.value ?: return@launch
+            val prepared = MediaAndExportHelper.compressImageToPayload(appContext, uri)
+            if (prepared.isFailure) {
+                _actionBanner.value = prepared.exceptionOrNull()?.message ?: "Could not prepare photo"
+                return@launch
+            }
+            val payload = prepared.getOrThrow()
+            sendPreparedMediaMessage(
+                familyId = fam.id,
+                memberUids = fam.memberUids,
+                type = "IMAGE",
+                text = caption.ifBlank { payload.fileName },
+                mediaFile = payload.file,
+                fileName = payload.fileName,
+                mimeType = payload.mimeType,
+                sizeBytes = payload.sizeBytes,
+                base64 = payload.base64,
+                replyTarget = replyTarget
+            )
+        }
+    }
+
+    fun sendDocumentAttachment(uri: Uri, caption: String = "") {
+        val replyTarget = _replyingToMessage.value
+        _replyingToMessage.value = null
+        viewModelScope.launch {
+            val fam = activeFamily.value ?: return@launch
+            val prepared = MediaAndExportHelper.readDocumentWithinLimit(appContext, uri)
+            if (prepared.isFailure) {
+                _actionBanner.value = prepared.exceptionOrNull()?.message ?: "Document exceeded limit"
+                return@launch
+            }
+            val payload = prepared.getOrThrow()
+            sendPreparedMediaMessage(
+                familyId = fam.id,
+                memberUids = fam.memberUids,
+                type = "DOCUMENT",
+                text = caption.ifBlank { payload.fileName },
+                mediaFile = payload.file,
+                fileName = payload.fileName,
+                mimeType = payload.mimeType,
+                sizeBytes = payload.sizeBytes,
+                base64 = payload.base64,
+                replyTarget = replyTarget
+            )
+        }
+    }
+
+    private suspend fun sendPreparedMediaMessage(
+        familyId: String,
+        memberUids: List<String>,
+        type: String,
+        text: String,
+        mediaFile: File,
+        fileName: String,
+        mimeType: String,
+        sizeBytes: Long,
+        base64: String,
+        replyTarget: ChatMessage?
+    ) {
+        val convId = _selectedConversationId.value
+        val conv = conversations.value.firstOrNull { it.id == convId }
+        val participants = conv?.participantUids?.ifEmpty { memberUids } ?: memberUids
+        val senderName = Firebase.auth.currentUser?.displayName ?: "Family Member"
+        val messageId = UUID.randomUUID().toString()
+        val nowMs = System.currentTimeMillis()
+        val replyPreview = replyTarget?.let { "${it.senderName}: ${it.text.take(70)}" }
+
+        localDb.pendingMessageDao().insertPending(
+            PendingMessageEntity(
+                id = messageId,
+                conversationId = convId,
+                familyId = familyId,
+                senderUid = currentUserId,
+                senderName = senderName,
+                participantUidsCsv = participants.joinToString(","),
+                type = type,
+                text = text,
+                mediaFilePath = mediaFile.absolutePath,
+                fileName = fileName,
+                mimeType = mimeType,
+                fileSizeBytes = sizeBytes,
+                replyToMessageId = replyTarget?.id,
+                replyToPreview = replyPreview,
+                clientCreatedAtMs = nowMs,
+                synced = false
+            )
+        )
+
+        val res = commRepo.sendMessageIdempotent(
+            messageId = messageId,
+            familyId = familyId,
+            conversationId = convId,
+            senderName = senderName,
+            participantUids = participants,
+            type = type,
+            text = text,
+            mediaBase64 = base64,
+            fileName = fileName,
+            mimeType = mimeType,
+            fileSizeBytes = sizeBytes,
+            replyToMessageId = replyTarget?.id,
+            replyToPreview = replyPreview,
+            clientCreatedAtMs = nowMs
+        )
+        if (res.isSuccess) {
+            localDb.pendingMessageDao().markSynced(messageId)
+        } else {
+            localDb.pendingMessageDao().markFailed(messageId, res.exceptionOrNull()?.message)
+            SyncScheduler.enqueueImmediateCommsSync(appContext)
+        }
+    }
+
+    fun retryPendingMessage(messageId: String) {
+        viewModelScope.launch {
+            localDb.pendingMessageDao().clearErrorForRetry(messageId)
+            val ok = SyncScheduler.flushOfflineComms(appContext, currentUserId)
+            if (!ok) SyncScheduler.enqueueImmediateCommsSync(appContext)
+        }
+    }
+
+    fun deletePendingMessage(messageId: String) {
+        viewModelScope.launch {
+            localDb.pendingMessageDao().deleteById(messageId)
+        }
+    }
+
+    fun toggleMessageReaction(msg: ChatMessage, emoji: String) {
+        viewModelScope.launch {
+            val fam = activeFamily.value ?: return@launch
+            commRepo.toggleReaction(fam.id, msg.conversationId, msg, emoji)
+        }
+    }
+
+    fun editMessage(msg: ChatMessage, newText: String) {
+        viewModelScope.launch {
+            val fam = activeFamily.value ?: return@launch
+            val res = commRepo.editMessageText(fam.id, msg.conversationId, msg.id, newText)
+            res.onFailure { _actionBanner.value = it.localizedMessage ?: "Edit failed" }
+        }
+    }
+
+    fun deleteMessageForAll(msg: ChatMessage) {
+        viewModelScope.launch {
+            val fam = activeFamily.value ?: return@launch
+            val res = commRepo.deleteMessageForAll(fam.id, msg.conversationId, msg.id)
+            res.onFailure { _actionBanner.value = it.localizedMessage ?: "Delete failed" }
+        }
+    }
+
+    fun toggleConversationFlag(conversationId: String, fieldName: String, enable: Boolean) {
+        viewModelScope.launch {
+            val fam = activeFamily.value ?: return@launch
+            commRepo.toggleConversationFlag(fam.id, conversationId, fieldName, enable)
+        }
+    }
+
+    fun openChatDocument(fileName: String, mimeType: String, base64: String) {
+        val res = MediaAndExportHelper.openBase64Document(appContext, fileName, mimeType, base64)
+        res.onFailure { _actionBanner.value = it.localizedMessage ?: "No app available to open file" }
     }
 
     // --- WEBRTC VOICE CALLS ---
@@ -976,8 +1497,238 @@ class MainViewModel(
         }
     }
 
+    // --- FAMILY HUB: CALENDAR, TASKS, EXPENSES, NOTICES, VAULT, NOTIFICATIONS ---
+    fun createCalendarEvent(
+        title: String,
+        description: String,
+        startAtMs: Long,
+        recurrence: String,
+        reminderMinutesBefore: Int
+    ) {
+        if (title.isBlank()) return
+        viewModelScope.launch {
+            val fam = activeFamily.value ?: return@launch
+            val name = Firebase.auth.currentUser?.displayName ?: "Family"
+            val res = hubRepo.createCalendarEvent(
+                familyId = fam.id,
+                title = title,
+                description = description,
+                startAtMs = startAtMs,
+                endAtMs = startAtMs + 60 * 60 * 1000L,
+                recurrence = recurrence,
+                reminderMinutesBefore = reminderMinutesBefore,
+                participantUids = fam.memberUids,
+                creatorName = name
+            )
+            res.onSuccess { _actionBanner.value = "Event added to Family Calendar." }
+                .onFailure { _actionBanner.value = it.localizedMessage ?: "Failed to add event" }
+        }
+    }
+
+    fun deleteCalendarEvent(eventId: String) {
+        viewModelScope.launch {
+            val fam = activeFamily.value ?: return@launch
+            hubRepo.deleteCalendarEvent(fam.id, eventId)
+        }
+    }
+
+    fun createTask(title: String, description: String, assignedTo: FamilyMember?, priority: String, dueAtMs: Long?) {
+        if (title.isBlank()) return
+        viewModelScope.launch {
+            val fam = activeFamily.value ?: return@launch
+            val creator = Firebase.auth.currentUser?.displayName ?: "Family"
+            val targetUid = assignedTo?.uid ?: currentUserId
+            val targetName = assignedTo?.displayName ?: creator
+            val res = hubRepo.createTask(
+                familyId = fam.id,
+                title = title,
+                description = description,
+                assignedToUid = targetUid,
+                assignedToName = targetName,
+                priority = priority,
+                dueAtMs = dueAtMs,
+                creatorName = creator
+            )
+            res.onSuccess {
+                _actionBanner.value = "Task created."
+                if (targetUid != currentUserId) {
+                    hubRepo.sendTargetedNotification(fam.id, targetUid, "New Family Task", title.take(100), "TASK")
+                }
+            }.onFailure { _actionBanner.value = it.localizedMessage ?: "Failed to create task" }
+        }
+    }
+
+    fun toggleTask(task: FamilyTask) {
+        viewModelScope.launch {
+            val fam = activeFamily.value ?: return@launch
+            hubRepo.toggleTaskCompletion(fam.id, task)
+        }
+    }
+
+    fun deleteTask(taskId: String) {
+        viewModelScope.launch {
+            val fam = activeFamily.value ?: return@launch
+            hubRepo.deleteTask(fam.id, taskId)
+        }
+    }
+
+    fun createExpense(title: String, category: String, amountBdt: Double, paidBy: FamilyMember?, notes: String) {
+        if (title.isBlank() || amountBdt <= 0.0) return
+        viewModelScope.launch {
+            val fam = activeFamily.value ?: return@launch
+            val myName = Firebase.auth.currentUser?.displayName ?: "Family"
+            val res = hubRepo.createExpense(
+                familyId = fam.id,
+                title = title,
+                category = category,
+                amountBdt = amountBdt,
+                paidByUid = paidBy?.uid ?: currentUserId,
+                paidByName = paidBy?.displayName ?: myName,
+                expenseDateMs = System.currentTimeMillis(),
+                notes = notes
+            )
+            res.onSuccess { _actionBanner.value = "Expense recorded (৳${amountBdt.toInt()})." }
+                .onFailure { _actionBanner.value = it.localizedMessage ?: "Failed to save expense" }
+        }
+    }
+
+    fun deleteExpense(expenseId: String) {
+        viewModelScope.launch {
+            val fam = activeFamily.value ?: return@launch
+            hubRepo.deleteExpense(fam.id, expenseId)
+        }
+    }
+
+    fun createNotice(title: String, body: String, pinned: Boolean, expiresAtMs: Long? = null) {
+        if (title.isBlank() || body.isBlank()) return
+        viewModelScope.launch {
+            val fam = activeFamily.value ?: return@launch
+            val myName = Firebase.auth.currentUser?.displayName ?: "Admin"
+            val res = hubRepo.createNotice(fam.id, title, body, pinned, expiresAtMs, myName)
+            res.onSuccess {
+                _actionBanner.value = "Notice published."
+                fam.memberUids.filter { it != currentUserId }.forEach { uid ->
+                    hubRepo.sendTargetedNotification(fam.id, uid, "Family Notice: ${title.take(50)}", body.take(120), "NOTICE")
+                }
+            }.onFailure { _actionBanner.value = it.localizedMessage ?: "Failed to publish notice" }
+        }
+    }
+
+    fun toggleNoticePin(notice: FamilyNotice) {
+        viewModelScope.launch {
+            val fam = activeFamily.value ?: return@launch
+            hubRepo.toggleNoticePinned(fam.id, notice)
+        }
+    }
+
+    fun markNoticeRead(noticeId: String) {
+        viewModelScope.launch {
+            val fam = activeFamily.value ?: return@launch
+            hubRepo.markNoticeRead(fam.id, noticeId)
+        }
+    }
+
+    fun deleteNotice(noticeId: String) {
+        viewModelScope.launch {
+            val fam = activeFamily.value ?: return@launch
+            hubRepo.deleteNotice(fam.id, noticeId)
+        }
+    }
+
+    fun uploadVaultDocument(uri: Uri, title: String, folder: String, allowedUids: List<String>) {
+        viewModelScope.launch {
+            val fam = activeFamily.value ?: return@launch
+            val prepared = MediaAndExportHelper.readDocumentWithinLimit(appContext, uri)
+            if (prepared.isFailure) {
+                _actionBanner.value = prepared.exceptionOrNull()?.message ?: "File exceeds 550 KB limit"
+                return@launch
+            }
+            val payload = prepared.getOrThrow()
+            val myName = Firebase.auth.currentUser?.displayName ?: "Family"
+            val res = hubRepo.uploadVaultFile(
+                familyId = fam.id,
+                title = title.ifBlank { payload.fileName },
+                folder = folder,
+                fileName = payload.fileName,
+                mimeType = payload.mimeType,
+                fileSizeBytes = payload.sizeBytes,
+                fileBase64 = payload.base64,
+                uploadedByName = myName,
+                allowedUids = allowedUids.ifEmpty { fam.memberUids }
+            )
+            res.onSuccess { _actionBanner.value = "Uploaded to Family Vault." }
+                .onFailure { _actionBanner.value = it.localizedMessage ?: "Upload failed" }
+        }
+    }
+
+    fun openVaultDocument(file: FamilyVaultFile) {
+        val res = MediaAndExportHelper.openBase64Document(appContext, file.fileName, file.mimeType, file.fileBase64)
+        res.onFailure { _actionBanner.value = it.localizedMessage ?: "Cannot open document" }
+    }
+
+    fun deleteVaultFile(fileId: String) {
+        viewModelScope.launch {
+            val fam = activeFamily.value ?: return@launch
+            hubRepo.deleteVaultFile(fam.id, fileId)
+        }
+    }
+
+    fun markNotificationSeen(cloudId: String?, localId: String?) {
+        viewModelScope.launch {
+            val fam = activeFamily.value
+            if (cloudId != null && fam != null) {
+                hubRepo.markNotificationSeen(fam.id, cloudId)
+            }
+            if (localId != null) {
+                localDb.appNotificationDao().markSeen(localId)
+            }
+        }
+    }
+
+    fun markAllNotificationsSeen() {
+        viewModelScope.launch {
+            val fam = activeFamily.value
+            if (fam != null) {
+                cloudNotifications.value.filter { !it.seen }.forEach { n ->
+                    hubRepo.markNotificationSeen(fam.id, n.id)
+                }
+            }
+            localDb.appNotificationDao().markAllSeen()
+        }
+    }
+
+    // --- CSV EXPORTS ---
+    fun exportNetworkHistory(deviceId: String?) {
+        val devs = effectiveAdminDevices.value
+        val devName = devs.firstOrNull { it.id == deviceId }?.deviceName ?: "All_Devices"
+        val evts = if (deviceId.isNullOrBlank()) networkEvents.value else networkEvents.value.filter { it.deviceId == deviceId }
+        val sess = if (deviceId.isNullOrBlank()) networkSessions.value else networkSessions.value.filter { it.deviceId == deviceId }
+        val csv = buildNetworkActivityCsv(devName, evts, sess)
+        MediaAndExportHelper.shareCsvReport(appContext, "network_activity_${devName}.csv", "Network Activity ($devName)", csv)
+            .onFailure { _actionBanner.value = it.localizedMessage ?: "Export failed" }
+    }
+
+    fun exportLocationHistory(deviceId: String?) {
+        val devs = effectiveAdminDevices.value
+        val devName = devs.firstOrNull { it.id == deviceId }?.deviceName ?: "All_Devices"
+        val recs = if (deviceId.isNullOrBlank()) sevenDayLocations.value else sevenDayLocations.value.filter { it.deviceId == deviceId }
+        val csv = buildLocationHistoryCsv(devName, recs)
+        MediaAndExportHelper.shareCsvReport(appContext, "route_history_${devName}.csv", "7-Day Route ($devName)", csv)
+            .onFailure { _actionBanner.value = it.localizedMessage ?: "Export failed" }
+    }
+
+    fun exportExpensesCsv() {
+        val csv = buildExpensesCsv(expenses.value)
+        MediaAndExportHelper.shareCsvReport(appContext, "family_expenses_bdt.csv", "Family Expenses (BDT)", csv)
+            .onFailure { _actionBanner.value = it.localizedMessage ?: "Export failed" }
+    }
+
     suspend fun prepareSignOut() {
+        activeFamily.value?.let { fam ->
+            familyRepo.updateMemberPresence(fam.id, online = false, typingActivity = "NONE")
+        }
         LocationForegroundService.stop(appContext)
+        NetworkActivityMonitor.stopMonitoring(appContext, logPauseEvent = false)
         cleanupCallResources()
         voiceRecorderPlayer.release()
         nearbyManager.stop()
@@ -991,7 +1742,8 @@ class MainViewModel(
         nearbyManager.stop()
     }
 
-    private companion object {
-        const val TAG = "MainViewModel"
+    companion object {
+        private const val TAG = "MainViewModel"
+        const val AUTHORIZED_ADMIN_EMAIL = "quixoratech@gmail.com"
     }
 }

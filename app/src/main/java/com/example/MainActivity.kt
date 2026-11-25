@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.filled.Bluetooth
+import androidx.compose.material.icons.filled.CalendarMonth
 import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.Dashboard
 import androidx.compose.material.icons.filled.Devices
@@ -20,7 +21,13 @@ import androidx.compose.material.icons.filled.GridOn
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Map
 import androidx.compose.material.icons.filled.MoreHoriz
+import androidx.compose.material.icons.filled.Notifications
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Timeline
+import androidx.compose.material.icons.filled.Wifi
+import androidx.compose.material3.Badge
+import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -76,9 +83,14 @@ import com.example.ui.screens.AdminMapScreen
 import com.example.ui.screens.AuthScreen
 import com.example.ui.screens.CallsScreen
 import com.example.ui.screens.ConsentAndPermissionsScreen
+import com.example.ui.screens.DeviceActivityCenterScreen
+import com.example.ui.screens.FamilyHubScreen
+import com.example.ui.screens.GlobalSearchScreen
 import com.example.ui.screens.LocationHistoryScreen
 import com.example.ui.screens.MessengerScreen
 import com.example.ui.screens.NearbyScreen
+import com.example.ui.screens.NetworkActivityScreen
+import com.example.ui.screens.NotificationsCenterScreen
 import com.example.ui.screens.OnboardingRoleScreen
 import com.example.ui.screens.SettingsScreen
 import com.example.ui.screens.TicTacToeScreen
@@ -96,12 +108,17 @@ sealed class AppRoute(val route: String) {
     data object Devices : AppRoute("devices")
     data object LiveMap : AppRoute("live_map")
     data object History : AppRoute("history")
+    data object NetworkActivity : AppRoute("network_activity")
+    data object ActivityCenter : AppRoute("activity_center")
     data object Chats : AppRoute("chats")
     data object VoiceMessages : AppRoute("voice_messages")
     data object Calls : AppRoute("calls")
     data object TicTacToe : AppRoute("tic_tac_toe")
+    data object FamilyHub : AppRoute("family_hub")
     data object Nearby : AppRoute("nearby")
     data object Settings : AppRoute("settings")
+    data object Notifications : AppRoute("notifications")
+    data object Search : AppRoute("search")
 }
 
 private data class NavTab(
@@ -163,8 +180,9 @@ fun AppRoot() {
             )
         } else {
             val uid = user.uid
+            val email = user.email.orEmpty()
             key(uid) {
-                AuthenticatedAppHost(currentUserId = uid)
+                AuthenticatedAppHost(currentUserId = uid, currentUserEmail = email)
             }
         }
     }
@@ -172,13 +190,13 @@ fun AppRoot() {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun AuthenticatedAppHost(currentUserId: String) {
+fun AuthenticatedAppHost(currentUserId: String, currentUserEmail: String) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val credentialManager = remember(context) { CredentialManager.create(context) }
 
     val viewModel: MainViewModel = viewModel(
-        key = currentUserId,
+        key = "${currentUserId}_${currentUserEmail.lowercase()}",
         factory = viewModelFactory {
             initializer {
                 val app = checkNotNull(this[APPLICATION_KEY])
@@ -187,6 +205,7 @@ fun AuthenticatedAppHost(currentUserId: String) {
                 MainViewModel(
                     appContext = app.applicationContext,
                     currentUserId = currentUserId,
+                    currentUserEmail = currentUserEmail,
                     familyRepo = FamilyRepository(db),
                     commRepo = CommunicationRepository(db),
                     prefs = AppPreferences(app.applicationContext),
@@ -228,6 +247,8 @@ fun AuthenticatedAppHost(currentUserId: String) {
             val errMsg = (familiesState as UiState.Error).message
             OnboardingRoleScreen(
                 language = settings.language,
+                allowedAdminEmail = viewModel.isAllowedAdminEmail,
+                signedInEmail = currentUserEmail,
                 isBusy = isBusy,
                 bannerError = errMsg,
                 onClearError = {},
@@ -240,6 +261,8 @@ fun AuthenticatedAppHost(currentUserId: String) {
             if (family == null) {
                 OnboardingRoleScreen(
                     language = settings.language,
+                    allowedAdminEmail = viewModel.isAllowedAdminEmail,
+                    signedInEmail = currentUserEmail,
                     isBusy = isBusy,
                     bannerError = banner,
                     onClearError = viewModel::clearBanner,
@@ -251,7 +274,10 @@ fun AuthenticatedAppHost(currentUserId: String) {
                     language = settings.language,
                     isAdmin = isBackendAdmin,
                     onAgreeAndStart = viewModel::grantConsentAndEnableSharing,
-                    onSkipLocation = viewModel::skipLocationSharingForNow
+                    onSkipLocation = viewModel::skipLocationSharingForNow,
+                    onAgreeAndStartWithOptions = { enableLoc, enableNet ->
+                        viewModel.grantConsentAndEnableSharing(enableLoc, enableNet)
+                    }
                 )
             } else {
                 val members by viewModel.familyMembers.collectAsStateWithLifecycle()
@@ -282,6 +308,17 @@ fun AuthenticatedAppHost(currentUserId: String) {
                 val nearbyPeers by viewModel.nearbyPeers.collectAsStateWithLifecycle()
                 val nearbyPackets by viewModel.nearbyPackets.collectAsStateWithLifecycle()
                 val nearbyStatus by viewModel.nearbyStatus.collectAsStateWithLifecycle()
+                val networkEvents by viewModel.networkEvents.collectAsStateWithLifecycle()
+                val networkSessions by viewModel.networkSessions.collectAsStateWithLifecycle()
+                val calendarEvents by viewModel.calendarEvents.collectAsStateWithLifecycle()
+                val tasks by viewModel.tasks.collectAsStateWithLifecycle()
+                val expenses by viewModel.expenses.collectAsStateWithLifecycle()
+                val notices by viewModel.notices.collectAsStateWithLifecycle()
+                val vaultFiles by viewModel.vaultFiles.collectAsStateWithLifecycle()
+                val cloudNotifications by viewModel.cloudNotifications.collectAsStateWithLifecycle()
+                val localNotifications by viewModel.localNotifications.collectAsStateWithLifecycle()
+                val unreadNotificationCount by viewModel.unreadNotificationCount.collectAsStateWithLifecycle()
+                val replyingToMessage by viewModel.replyingToMessage.collectAsStateWithLifecycle()
 
                 // Strictly role-separated navigation: Family users NEVER see Admin tracking routes!
                 val allTabs = remember(isBackendAdmin, strings) {
@@ -291,9 +328,12 @@ fun AuthenticatedAppHost(currentUserId: String) {
                             NavTab(AppRoute.Devices, strings.navDevices, Icons.Default.Devices),
                             NavTab(AppRoute.LiveMap, strings.navMap, Icons.Default.Map),
                             NavTab(AppRoute.History, strings.navHistory, Icons.Default.History),
+                            NavTab(AppRoute.NetworkActivity, strings.navNetworkHistory, Icons.Default.Wifi),
+                            NavTab(AppRoute.ActivityCenter, strings.navActivityCenter, Icons.Default.Timeline),
                             NavTab(AppRoute.Chats, strings.navChats, Icons.AutoMirrored.Filled.Chat),
                             NavTab(AppRoute.Calls, strings.navCalls, Icons.Default.Call),
                             NavTab(AppRoute.TicTacToe, strings.navTicTacToe, Icons.Default.GridOn),
+                            NavTab(AppRoute.FamilyHub, strings.navFamilyHub, Icons.Default.CalendarMonth),
                             NavTab(AppRoute.Nearby, strings.navNearby, Icons.Default.Bluetooth),
                             NavTab(AppRoute.Settings, strings.navSettings, Icons.Default.Settings)
                         )
@@ -303,6 +343,7 @@ fun AuthenticatedAppHost(currentUserId: String) {
                             NavTab(AppRoute.VoiceMessages, strings.navVoice, Icons.Default.GraphicEq),
                             NavTab(AppRoute.Calls, strings.navCalls, Icons.Default.Call),
                             NavTab(AppRoute.TicTacToe, strings.navTicTacToe, Icons.Default.GridOn),
+                            NavTab(AppRoute.FamilyHub, strings.navFamilyHub, Icons.Default.CalendarMonth),
                             NavTab(AppRoute.Nearby, strings.navNearby, Icons.Default.Bluetooth),
                             NavTab(AppRoute.Settings, strings.navSettings, Icons.Default.Settings)
                         )
@@ -328,10 +369,47 @@ fun AuthenticatedAppHost(currentUserId: String) {
                             TopAppBar(
                                 title = {
                                     Text(
-                                        allTabs.firstOrNull { it.route.route == currentRoute }?.label ?: strings.appName
+                                        when (currentRoute) {
+                                            AppRoute.Notifications.route -> strings.navNotifications
+                                            AppRoute.Search.route -> strings.navSearch
+                                            else -> allTabs.firstOrNull { it.route.route == currentRoute }?.label ?: strings.appName
+                                        }
                                     )
                                 },
                                 actions = {
+                                    IconButton(
+                                        onClick = {
+                                            navController.navigate(AppRoute.Search.route) {
+                                                launchSingleTop = true
+                                            }
+                                        },
+                                        modifier = Modifier.testTag("top_search_button")
+                                    ) {
+                                        Icon(Icons.Default.Search, contentDescription = strings.navSearch)
+                                    }
+                                    IconButton(
+                                        onClick = {
+                                            navController.navigate(AppRoute.Notifications.route) {
+                                                launchSingleTop = true
+                                            }
+                                        },
+                                        modifier = Modifier.testTag("top_notifications_button")
+                                    ) {
+                                        BadgedBox(
+                                            badge = {
+                                                if (unreadNotificationCount > 0) {
+                                                    Badge {
+                                                        Text(
+                                                            if (unreadNotificationCount > 99) "99+"
+                                                            else unreadNotificationCount.toString()
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                        ) {
+                                            Icon(Icons.Default.Notifications, contentDescription = strings.navNotifications)
+                                        }
+                                    }
                                     if (!useRail && overflowTabs.isNotEmpty()) {
                                         Box {
                                             IconButton(
@@ -427,7 +505,14 @@ fun AuthenticatedAppHost(currentUserId: String) {
                                             onlyDevicesList = false,
                                             onGenerateCode = viewModel::generatePairingCode,
                                             onSyncNow = viewModel::captureLocationAndQueueSync,
-                                            onRevokeDevice = viewModel::revokeDevice
+                                            onRevokeDevice = viewModel::revokeDevice,
+                                            onRenameDevice = viewModel::renamePairedDevice,
+                                            onOpenNetworkHistory = {
+                                                navController.navigate(AppRoute.NetworkActivity.route) { launchSingleTop = true }
+                                            },
+                                            onOpenActivityCenter = {
+                                                navController.navigate(AppRoute.ActivityCenter.route) { launchSingleTop = true }
+                                            }
                                         )
                                     }
                                     composable(AppRoute.Devices.route) {
@@ -443,7 +528,14 @@ fun AuthenticatedAppHost(currentUserId: String) {
                                             onlyDevicesList = true,
                                             onGenerateCode = viewModel::generatePairingCode,
                                             onSyncNow = viewModel::captureLocationAndQueueSync,
-                                            onRevokeDevice = viewModel::revokeDevice
+                                            onRevokeDevice = viewModel::revokeDevice,
+                                            onRenameDevice = viewModel::renamePairedDevice,
+                                            onOpenNetworkHistory = {
+                                                navController.navigate(AppRoute.NetworkActivity.route) { launchSingleTop = true }
+                                            },
+                                            onOpenActivityCenter = {
+                                                navController.navigate(AppRoute.ActivityCenter.route) { launchSingleTop = true }
+                                            }
                                         )
                                     }
                                     composable(AppRoute.LiveMap.route) {
@@ -458,7 +550,29 @@ fun AuthenticatedAppHost(currentUserId: String) {
                                         LocationHistoryScreen(
                                             language = settings.language,
                                             devices = adminDevices,
-                                            records = sevenDayLocations
+                                            records = sevenDayLocations,
+                                            onExportHistory = viewModel::exportLocationHistory
+                                        )
+                                    }
+                                    composable(AppRoute.NetworkActivity.route) {
+                                        NetworkActivityScreen(
+                                            language = settings.language,
+                                            devices = adminDevices,
+                                            events = networkEvents,
+                                            sessions = networkSessions,
+                                            onExportCsv = viewModel::exportNetworkHistory
+                                        )
+                                    }
+                                    composable(AppRoute.ActivityCenter.route) {
+                                        DeviceActivityCenterScreen(
+                                            language = settings.language,
+                                            devices = adminDevices,
+                                            networkEvents = networkEvents,
+                                            networkSessions = networkSessions,
+                                            locations = sevenDayLocations,
+                                            onRenameDevice = viewModel::renamePairedDevice,
+                                            onTogglePauseDevice = viewModel::setDevicePausedOrRevoked,
+                                            onRemoveDevice = viewModel::removePairedDevice
                                         )
                                     }
                                 }
@@ -479,7 +593,20 @@ fun AuthenticatedAppHost(currentUserId: String) {
                                         onSelectConversation = viewModel::selectConversation,
                                         onOpenDirectChat = viewModel::openDirectChat,
                                         onSendText = viewModel::sendTextMessage,
-                                        onSendVoiceNote = viewModel::sendVoiceNote
+                                        onSendVoiceNote = viewModel::sendVoiceNote,
+                                        isAdminViewer = isBackendAdmin,
+                                        replyingTo = replyingToMessage,
+                                        onSetReplyTarget = viewModel::setReplyTarget,
+                                        onTypingChanged = viewModel::onChatTypingStateChanged,
+                                        onSendImageUri = { viewModel.sendImageAttachment(it) },
+                                        onSendDocumentUri = { viewModel.sendDocumentAttachment(it) },
+                                        onRetryPending = viewModel::retryPendingMessage,
+                                        onDeletePending = viewModel::deletePendingMessage,
+                                        onToggleReaction = viewModel::toggleMessageReaction,
+                                        onEditMessage = viewModel::editMessage,
+                                        onDeleteForAll = viewModel::deleteMessageForAll,
+                                        onToggleConversationFlag = viewModel::toggleConversationFlag,
+                                        onOpenDocument = viewModel::openChatDocument
                                     )
                                 }
 
@@ -499,7 +626,20 @@ fun AuthenticatedAppHost(currentUserId: String) {
                                         onSelectConversation = viewModel::selectConversation,
                                         onOpenDirectChat = viewModel::openDirectChat,
                                         onSendText = viewModel::sendTextMessage,
-                                        onSendVoiceNote = viewModel::sendVoiceNote
+                                        onSendVoiceNote = viewModel::sendVoiceNote,
+                                        isAdminViewer = isBackendAdmin,
+                                        replyingTo = replyingToMessage,
+                                        onSetReplyTarget = viewModel::setReplyTarget,
+                                        onTypingChanged = viewModel::onChatTypingStateChanged,
+                                        onSendImageUri = { viewModel.sendImageAttachment(it) },
+                                        onSendDocumentUri = { viewModel.sendDocumentAttachment(it) },
+                                        onRetryPending = viewModel::retryPendingMessage,
+                                        onDeletePending = viewModel::deletePendingMessage,
+                                        onToggleReaction = viewModel::toggleMessageReaction,
+                                        onEditMessage = viewModel::editMessage,
+                                        onDeleteForAll = viewModel::deleteMessageForAll,
+                                        onToggleConversationFlag = viewModel::toggleConversationFlag,
+                                        onOpenDocument = viewModel::openChatDocument
                                     )
                                 }
 
@@ -538,6 +678,35 @@ fun AuthenticatedAppHost(currentUserId: String) {
                                     )
                                 }
 
+                                composable(AppRoute.FamilyHub.route) {
+                                    FamilyHubScreen(
+                                        language = settings.language,
+                                        currentUserId = currentUserId,
+                                        isAdmin = isBackendAdmin,
+                                        members = members,
+                                        calendarEvents = calendarEvents,
+                                        tasks = tasks,
+                                        expenses = expenses,
+                                        notices = notices,
+                                        vaultFiles = vaultFiles,
+                                        onCreateEvent = viewModel::createCalendarEvent,
+                                        onDeleteEvent = viewModel::deleteCalendarEvent,
+                                        onCreateTask = viewModel::createTask,
+                                        onToggleTask = viewModel::toggleTask,
+                                        onDeleteTask = viewModel::deleteTask,
+                                        onCreateExpense = viewModel::createExpense,
+                                        onDeleteExpense = viewModel::deleteExpense,
+                                        onExportExpenses = viewModel::exportExpensesCsv,
+                                        onCreateNotice = { t, b, pinned -> viewModel.createNotice(t, b, pinned) },
+                                        onToggleNoticePin = viewModel::toggleNoticePin,
+                                        onMarkNoticeRead = viewModel::markNoticeRead,
+                                        onDeleteNotice = viewModel::deleteNotice,
+                                        onUploadVaultFile = viewModel::uploadVaultDocument,
+                                        onOpenVaultFile = viewModel::openVaultDocument,
+                                        onDeleteVaultFile = viewModel::deleteVaultFile
+                                    )
+                                }
+
                                 composable(AppRoute.Nearby.route) {
                                     NearbyScreen(
                                         language = settings.language,
@@ -568,6 +737,40 @@ fun AuthenticatedAppHost(currentUserId: String) {
                                                 scope = scope,
                                                 beforeAuthSignOut = { viewModel.prepareSignOut() }
                                             )
+                                        },
+                                        onToggleNetworkMonitoring = viewModel::toggleNetworkMonitoring,
+                                        onSetLocationInterval = viewModel::setLocationIntervalMinutes,
+                                        onSetLastSeenPrivacy = viewModel::setLastSeenPrivacy,
+                                        onSetAvailability = viewModel::setAvailability
+                                    )
+                                }
+
+                                composable(AppRoute.Notifications.route) {
+                                    NotificationsCenterScreen(
+                                        cloudNotifications = cloudNotifications,
+                                        localNotifications = localNotifications,
+                                        onMarkSeen = viewModel::markNotificationSeen,
+                                        onMarkAllSeen = viewModel::markAllNotificationsSeen
+                                    )
+                                }
+
+                                composable(AppRoute.Search.route) {
+                                    GlobalSearchScreen(
+                                        isAdmin = isBackendAdmin,
+                                        messages = messages,
+                                        members = members,
+                                        devices = if (isBackendAdmin) adminDevices else emptyList(),
+                                        tasks = tasks,
+                                        calendarEvents = calendarEvents,
+                                        notices = notices,
+                                        vaultFiles = vaultFiles,
+                                        onNavigateResult = { res ->
+                                            val dest = if (res.targetRoute == AppRoute.Devices.route && !isBackendAdmin) {
+                                                AppRoute.Chats.route
+                                            } else {
+                                                res.targetRoute
+                                            }
+                                            navController.navigate(dest) { launchSingleTop = true }
                                         }
                                     )
                                 }

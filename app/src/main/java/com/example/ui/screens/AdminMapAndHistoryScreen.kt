@@ -16,6 +16,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
@@ -24,6 +25,7 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -222,7 +224,8 @@ fun AdminMapScreen(
 fun LocationHistoryScreen(
     language: String,
     devices: List<PairedDevice>,
-    records: List<LocationRecord>
+    records: List<LocationRecord>,
+    onExportHistory: (String?) -> Unit = {}
 ) {
     val strings = stringsFor(language)
     val context = LocalContext.current
@@ -329,12 +332,16 @@ fun LocationHistoryScreen(
                             Spacer(Modifier.width(4.dp))
                             Text(if (isPlaying) strings.pauseHistoryBtn else strings.playHistoryBtn)
                         }
-                        Spacer(Modifier.width(12.dp))
+                        Spacer(Modifier.width(8.dp))
                         if (active != null) {
                             Text(
                                 text = "${formatTimestamp(active.recordedAtMs)} (±${active.accuracyMeters.toInt()}m)",
-                                style = MaterialTheme.typography.bodySmall
+                                style = MaterialTheme.typography.bodySmall,
+                                modifier = Modifier.weight(1f)
                             )
+                        }
+                        OutlinedButton(onClick = { onExportHistory(selectedDeviceId.ifBlank { null }) }) {
+                            Icon(Icons.Default.Download, contentDescription = "Export CSV")
                         }
                     }
                     if (deviceRecords.size > 1) {
@@ -378,8 +385,12 @@ fun LocationHistoryScreen(
                                 Text(rec.source, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
                             }
                             Spacer(Modifier.height(2.dp))
+                            val movementLabel = when {
+                                (rec.speedMps ?: 0.0) >= 1.2 -> "Moving (${"%.1f".format(rec.speedMps)} m/s)"
+                                else -> "Stationary"
+                            }
                             Text(
-                                "%.5f, %.5f • ±${rec.accuracyMeters.toInt()}m • Bat ${rec.batteryPercent}% (${rec.networkType})".format(
+                                "%.5f, %.5f • ±${rec.accuracyMeters.toInt()}m • $movementLabel • Bat ${rec.batteryPercent}% (${rec.networkType})".format(
                                     rec.latitude, rec.longitude
                                 ),
                                 style = MaterialTheme.typography.labelSmall,

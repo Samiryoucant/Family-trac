@@ -241,19 +241,21 @@ class WebRtcCallManager(private val context: Context) {
 
     private fun setSpeakerRouting(enableSpeaker: Boolean) {
         val am = audioManager ?: return
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            if (enableSpeaker) {
-                val speaker = am.availableCommunicationDevices
-                    .firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
-                if (speaker != null) {
-                    am.setCommunicationDevice(speaker)
+        runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                if (enableSpeaker) {
+                    val speaker = am.availableCommunicationDevices
+                        .firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+                    if (speaker != null) {
+                        am.setCommunicationDevice(speaker)
+                    }
+                } else {
+                    am.clearCommunicationDevice()
                 }
             } else {
-                am.clearCommunicationDevice()
+                @Suppress("DEPRECATION")
+                am.isSpeakerphoneOn = enableSpeaker
             }
-        } else {
-            @Suppress("DEPRECATION")
-            am.isSpeakerphoneOn = enableSpeaker
         }
     }
 
@@ -268,7 +270,7 @@ class WebRtcCallManager(private val context: Context) {
         _isMuted.value = false
         _isSpeakerOn.value = false
         setSpeakerRouting(false)
-        audioManager?.mode = AudioManager.MODE_NORMAL
+        runCatching { audioManager?.mode = AudioManager.MODE_NORMAL }
         _callState.value = WebRtcCallState.IDLE
         _statusMessage.value = ""
     }

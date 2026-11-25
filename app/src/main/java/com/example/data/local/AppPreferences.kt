@@ -5,6 +5,7 @@ import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
@@ -25,6 +26,11 @@ data class LocalAppSettings(
     val activeAdminUid: String = "",
     val consentGranted: Boolean = false,
     val locationSharingEnabled: Boolean = false,
+    val networkMonitoringConsent: Boolean = false,
+    val networkMonitoringEnabled: Boolean = false,
+    val lastSeenPrivacy: String = "EVERYONE",
+    val availability: String = "AVAILABLE",
+    val locationIntervalMinutes: Int = 30,
     val lastSyncMs: Long = 0L,
     val turnServerUrl: String = "",
     val turnUsername: String = "",
@@ -41,6 +47,11 @@ class AppPreferences(private val context: Context) {
         val ACTIVE_ADMIN_UID = stringPreferencesKey("active_admin_uid")
         val CONSENT_GRANTED = booleanPreferencesKey("consent_granted")
         val LOCATION_SHARING_ENABLED = booleanPreferencesKey("location_sharing_enabled")
+        val NETWORK_MONITORING_CONSENT = booleanPreferencesKey("network_monitoring_consent")
+        val NETWORK_MONITORING_ENABLED = booleanPreferencesKey("network_monitoring_enabled")
+        val LAST_SEEN_PRIVACY = stringPreferencesKey("last_seen_privacy")
+        val AVAILABILITY = stringPreferencesKey("availability")
+        val LOCATION_INTERVAL_MINUTES = intPreferencesKey("location_interval_minutes")
         val LAST_SYNC_MS = longPreferencesKey("last_sync_ms")
         val TURN_URL = stringPreferencesKey("turn_url")
         val TURN_USERNAME = stringPreferencesKey("turn_username")
@@ -50,6 +61,7 @@ class AppPreferences(private val context: Context) {
     val settingsFlow: Flow<LocalAppSettings> = context.dataStore.data.map { prefs ->
         val themeStr = prefs[Keys.THEME] ?: ThemePreference.SYSTEM.name
         val theme = ThemePreference.entries.firstOrNull { it.name == themeStr } ?: ThemePreference.SYSTEM
+        val interval = (prefs[Keys.LOCATION_INTERVAL_MINUTES] ?: 30).coerceIn(15, 120)
         LocalAppSettings(
             deviceId = prefs[Keys.DEVICE_ID] ?: "",
             language = prefs[Keys.LANGUAGE] ?: "en",
@@ -59,6 +71,11 @@ class AppPreferences(private val context: Context) {
             activeAdminUid = prefs[Keys.ACTIVE_ADMIN_UID] ?: "",
             consentGranted = prefs[Keys.CONSENT_GRANTED] ?: false,
             locationSharingEnabled = prefs[Keys.LOCATION_SHARING_ENABLED] ?: false,
+            networkMonitoringConsent = prefs[Keys.NETWORK_MONITORING_CONSENT] ?: false,
+            networkMonitoringEnabled = prefs[Keys.NETWORK_MONITORING_ENABLED] ?: false,
+            lastSeenPrivacy = prefs[Keys.LAST_SEEN_PRIVACY] ?: "EVERYONE",
+            availability = prefs[Keys.AVAILABILITY] ?: "AVAILABLE",
+            locationIntervalMinutes = interval,
             lastSyncMs = prefs[Keys.LAST_SYNC_MS] ?: 0L,
             turnServerUrl = prefs[Keys.TURN_URL] ?: "",
             turnUsername = prefs[Keys.TURN_USERNAME] ?: "",
@@ -101,6 +118,31 @@ class AppPreferences(private val context: Context) {
         }
     }
 
+    suspend fun setNetworkMonitoringConsent(consentGranted: Boolean, enabled: Boolean) {
+        context.dataStore.edit {
+            it[Keys.NETWORK_MONITORING_CONSENT] = consentGranted
+            it[Keys.NETWORK_MONITORING_ENABLED] = enabled
+        }
+    }
+
+    suspend fun setNetworkMonitoringEnabled(enabled: Boolean) {
+        context.dataStore.edit {
+            it[Keys.NETWORK_MONITORING_ENABLED] = enabled
+        }
+    }
+
+    suspend fun setLastSeenPrivacy(privacy: String) {
+        context.dataStore.edit { it[Keys.LAST_SEEN_PRIVACY] = privacy }
+    }
+
+    suspend fun setAvailability(availability: String) {
+        context.dataStore.edit { it[Keys.AVAILABILITY] = availability }
+    }
+
+    suspend fun setLocationIntervalMinutes(minutes: Int) {
+        context.dataStore.edit { it[Keys.LOCATION_INTERVAL_MINUTES] = minutes.coerceIn(15, 120) }
+    }
+
     suspend fun setLocationSharingEnabled(enabled: Boolean) {
         context.dataStore.edit { it[Keys.LOCATION_SHARING_ENABLED] = enabled }
     }
@@ -123,6 +165,7 @@ class AppPreferences(private val context: Context) {
             it.remove(Keys.ACTIVE_FAMILY_ID)
             it.remove(Keys.ACTIVE_ADMIN_UID)
             it[Keys.LOCATION_SHARING_ENABLED] = false
+            it[Keys.NETWORK_MONITORING_ENABLED] = false
         }
     }
 }

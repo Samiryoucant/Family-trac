@@ -17,6 +17,7 @@ import com.example.data.local.AppPreferences
 import com.example.data.local.FamilyTrackDatabase
 import com.example.data.local.SyncStatusEntity
 import com.example.data.remote.CommunicationRepository
+import com.example.data.remote.FamilyHubRepository
 import com.example.data.remote.FamilyRepository
 import com.google.firebase.Firebase
 import com.google.firebase.auth.auth
@@ -40,6 +41,15 @@ class LocationSyncWorker(
             return Result.success()
         }
 
+        if (settings.networkMonitoringConsent && settings.networkMonitoringEnabled) {
+            NetworkActivityMonitor.recordSyncLifecycleEvent(
+                applicationContext,
+                "SYNC_STARTED",
+                "Background location & network sync started"
+            )
+            NetworkActivityMonitor.heartbeatActiveSession(applicationContext)
+        }
+
         val repo = FamilyRepository(applicationContext)
         val pending = locDao.getPendingBatch()
         var hadFailure = false
@@ -61,7 +71,6 @@ class LocationSyncWorker(
                 recordedAtMs = record.recordedAtMs
             )
             if (uploadResult.isSuccess) {
-                // Only mark synced AFTER Firestore confirms receipt!
                 locDao.markSynced(record.id)
             } else {
                 hadFailure = true
@@ -69,10 +78,19 @@ class LocationSyncWorker(
             }
         }
 
-        // Update device status heartbeat & latest synced coordinates
+        val netOk = SyncScheduler.flushNetworkEventsAndSessions(applicationContext)
+        if (!netOk) hadFailure = true
+
+        // Update device status heartbeat & latest synced coordinates + live network telemetry
         val deviceId = prefs.getOrCreateDeviceId()
         val latest = locDao.getLatestForDevice(deviceId)
+        val latestNetEvt = db.networkEventDao().getLatestForDevice(deviceId)
+        val activeSessions = db.networkSessionDao().getOpenActiveSessions(deviceId)
+        val activeSess = activeSessions.firstOrNull()
+        val snap = NetworkActivityMonitor.currentSnapshot()
+        val netType = LocationCaptureHelper.getNetworkType(applicationContext)
         val nowMs = System.currentTimeMillis()
+
         val deviceUpdateResult = repo.updateOwnDeviceStatus(
             familyId = settings.activeFamilyId,
             deviceId = deviceId,
@@ -81,13 +99,23 @@ class LocationSyncWorker(
             locationPermissionGranted = LocationCaptureHelper.hasForegroundLocationPermission(applicationContext),
             backgroundPermissionGranted = LocationCaptureHelper.hasBackgroundLocationPermission(applicationContext),
             batteryPercent = LocationCaptureHelper.getBatteryPercent(applicationContext),
-            networkType = LocationCaptureHelper.getNetworkType(applicationContext),
-            online = LocationCaptureHelper.getNetworkType(applicationContext) != "OFFLINE",
+            networkType = netType,
+            online = netType != "OFFLINE",
             lastLatitude = latest?.latitude,
             lastLongitude = latest?.longitude,
             lastAccuracyMeters = latest?.accuracyMeters?.toDouble(),
             lastLocationAtMs = latest?.recordedAtMs,
-            lastSyncAtMs = if (!hadFailure) nowMs else null
+            lastSyncAtMs = if (!hadFailure) nowMs else null,
+            networkConsentGranted = settings.networkMonitoringConsent,
+            networkMonitoringEnabled = settings.networkMonitoringEnabled,
+            currentWifiAvailable = snap.wifiAvailable || netType == "WIFI",
+            currentCellularAvailable = snap.cellularAvailable || netType == "CELLULAR",
+            internetAvailable = snap.internetAvailable || netType != "OFFLINE",
+            currentNetworkSessionId = activeSess?.id.orEmpty(),
+            currentSessionStartedAtMs = activeSess?.startedAtMs,
+            lastNetworkEventType = latestNetEvt?.eventType,
+            lastNetworkEventAtMs = latestNetEvt?.detectedAtMs,
+            lastActiveAtMs = nowMs
         )
 
         if (!hadFailure && deviceUpdateResult.isSuccess) {
@@ -99,34 +127,69 @@ class LocationSyncWorker(
                     lastError = null
                 )
             )
+            if (settings.networkMonitoringConsent && settings.networkMonitoringEnabled) {
+                NetworkActivityMonitor.recordSyncLifecycleEvent(
+                    applicationContext,
+                    "SYNC_COMPLETED",
+                    "Location & network telemetry sync completed"
+                )
+                SyncScheduler.flushNetworkEventsAndSessions(applicationContext)
+            }
         } else {
-            // Check if Admin revoked this device; if so, halt foreground sharing cleanly
             val ownDevices = runCatching {
                 repo.observeOwnDevice(settings.activeFamilyId, user.uid).first()
             }.getOrDefault(emptyList())
             val isRevoked = ownDevices.firstOrNull { it.id == deviceId }?.revoked == true
             if (isRevoked) {
                 prefs.setConsentAndSharing(consentGranted = false, sharingEnabled = false)
+                prefs.setNetworkMonitoringEnabled(false)
                 LocationForegroundService.stop(applicationContext)
+                NetworkActivityMonitor.stopMonitoring(applicationContext, logPauseEvent = false)
                 return Result.success()
             }
+            val errMsg = deviceUpdateResult.exceptionOrNull()?.message ?: "Pending retry"
             db.syncStatusDao().upsert(
                 SyncStatusEntity(
                     lastSuccessfulSyncMs = settings.lastSyncMs,
                     lastSyncAttemptMs = nowMs,
-                    lastError = deviceUpdateResult.exceptionOrNull()?.message ?: "Pending retry"
+                    lastError = errMsg
                 )
             )
+            if (settings.networkMonitoringConsent && settings.networkMonitoringEnabled) {
+                NetworkActivityMonitor.recordSyncLifecycleEvent(
+                    applicationContext,
+                    "SYNC_FAILED",
+                    "Sync error: ${errMsg.take(120)}"
+                )
+            }
         }
 
-        // Prune ONLY already-synced local records older than 7 days (never delete unsynced records!)
         val sevenDaysAgoMs = nowMs - 7L * 24L * 60L * 60L * 1000L
         locDao.pruneSyncedOlderThan(sevenDaysAgoMs)
+        val thirtyDaysAgoMs = nowMs - 30L * 24L * 60L * 60L * 1000L
+        db.networkEventDao().pruneSyncedOlderThan(thirtyDaysAgoMs)
+        db.networkSessionDao().pruneOldSynced(thirtyDaysAgoMs)
 
-        // Also flush any pending offline messages / game moves
         SyncScheduler.flushOfflineComms(applicationContext, user.uid)
 
         return if (hadFailure || deviceUpdateResult.isFailure) Result.retry() else Result.success()
+    }
+}
+
+class NetworkSyncWorker(
+    appContext: Context,
+    params: WorkerParameters
+) : CoroutineWorker(appContext, params) {
+    override suspend fun doWork(): Result {
+        val user = Firebase.auth.currentUser ?: return Result.success()
+        val settings = AppPreferences(applicationContext).settingsFlow.first()
+        if (settings.activeFamilyId.isBlank()) return Result.success()
+        if (settings.networkMonitoringConsent && settings.networkMonitoringEnabled) {
+            NetworkActivityMonitor.heartbeatActiveSession(applicationContext)
+        }
+        val ok = SyncScheduler.flushNetworkEventsAndSessions(applicationContext)
+        val commsOk = SyncScheduler.flushOfflineComms(applicationContext, user.uid)
+        return if (ok && commsOk) Result.success() else Result.retry()
     }
 }
 
@@ -144,20 +207,22 @@ class CommunicationSyncWorker(
 object SyncScheduler {
     private const val PERIODIC_LOCATION_WORK = "familytrack_periodic_location_sync"
     private const val IMMEDIATE_LOCATION_WORK = "familytrack_immediate_location_sync"
+    private const val IMMEDIATE_NETWORK_WORK = "familytrack_immediate_network_sync"
     private const val IMMEDIATE_COMMS_WORK = "familytrack_immediate_comms_sync"
 
     private val connectedConstraints = Constraints.Builder()
         .setRequiredNetworkType(NetworkType.CONNECTED)
         .build()
 
-    fun schedulePeriodicSync(context: Context) {
-        val request = PeriodicWorkRequestBuilder<LocationSyncWorker>(1, TimeUnit.HOURS)
+    fun schedulePeriodicSync(context: Context, intervalMinutes: Int = 30, replace: Boolean = false) {
+        val safeMinutes = intervalMinutes.coerceIn(15, 120).toLong()
+        val request = PeriodicWorkRequestBuilder<LocationSyncWorker>(safeMinutes, TimeUnit.MINUTES)
             .setConstraints(connectedConstraints)
             .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 5, TimeUnit.MINUTES)
             .build()
         WorkManager.getInstance(context).enqueueUniquePeriodicWork(
             PERIODIC_LOCATION_WORK,
-            ExistingPeriodicWorkPolicy.KEEP,
+            if (replace) ExistingPeriodicWorkPolicy.UPDATE else ExistingPeriodicWorkPolicy.KEEP,
             request
         )
     }
@@ -174,6 +239,18 @@ object SyncScheduler {
         )
     }
 
+    fun enqueueImmediateNetworkSync(context: Context) {
+        val request = OneTimeWorkRequestBuilder<NetworkSyncWorker>()
+            .setConstraints(connectedConstraints)
+            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 20, TimeUnit.SECONDS)
+            .build()
+        WorkManager.getInstance(context).enqueueUniqueWork(
+            IMMEDIATE_NETWORK_WORK,
+            ExistingWorkPolicy.REPLACE,
+            request
+        )
+    }
+
     fun enqueueImmediateCommsSync(context: Context) {
         val request = OneTimeWorkRequestBuilder<CommunicationSyncWorker>()
             .setConstraints(connectedConstraints)
@@ -184,6 +261,35 @@ object SyncScheduler {
             ExistingWorkPolicy.REPLACE,
             request
         )
+    }
+
+    suspend fun flushNetworkEventsAndSessions(context: Context): Boolean {
+        if (Firebase.auth.currentUser == null) return true
+        val db = FamilyTrackDatabase.getInstance(context)
+        val hubRepo = FamilyHubRepository(context)
+        var allOk = true
+
+        val pendingSessions = db.networkSessionDao().getPendingSyncSessions()
+        for (sess in pendingSessions) {
+            val res = hubRepo.upsertNetworkSession(sess)
+            if (res.isSuccess) {
+                db.networkSessionDao().markSynced(sess.id)
+            } else {
+                allOk = false
+            }
+        }
+
+        val pendingEvents = db.networkEventDao().getPendingBatch()
+        for (evt in pendingEvents) {
+            val res = hubRepo.uploadNetworkEventIdempotent(evt)
+            if (res.isSuccess) {
+                db.networkEventDao().markSynced(evt.id)
+            } else {
+                allOk = false
+                db.networkEventDao().markSyncFailed(evt.id, res.exceptionOrNull()?.message)
+            }
+        }
+        return allOk
     }
 
     suspend fun flushOfflineComms(context: Context, currentUid: String): Boolean {
@@ -202,6 +308,14 @@ object SyncScheduler {
                     } else null
                 }.getOrNull()
             }
+            val mediaBase64 = pending.mediaFilePath?.let { path ->
+                runCatching {
+                    val file = File(path)
+                    if (file.exists() && file.length() <= 550_000L) {
+                        Base64.encodeToString(file.readBytes(), Base64.NO_WRAP)
+                    } else null
+                }.getOrNull()
+            }
             val result = commRepo.sendMessageIdempotent(
                 messageId = pending.id,
                 familyId = pending.familyId,
@@ -212,6 +326,12 @@ object SyncScheduler {
                 text = pending.text,
                 voiceAudioBase64 = voiceBase64,
                 voiceDurationMs = if (pending.voiceDurationMs > 0) pending.voiceDurationMs else null,
+                mediaBase64 = mediaBase64,
+                fileName = pending.fileName,
+                mimeType = pending.mimeType,
+                fileSizeBytes = if (pending.fileSizeBytes > 0L) pending.fileSizeBytes else null,
+                replyToMessageId = pending.replyToMessageId,
+                replyToPreview = pending.replyToPreview,
                 clientCreatedAtMs = pending.clientCreatedAtMs
             )
             if (result.isSuccess) {

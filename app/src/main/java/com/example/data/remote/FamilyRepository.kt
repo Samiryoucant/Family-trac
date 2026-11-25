@@ -65,7 +65,8 @@ class FamilyRepository(
         role: String,
         language: String,
         familyId: String? = null,
-        deviceId: String? = null
+        deviceId: String? = null,
+        lastSeenPrivacy: String? = null
     ): Result<Unit> {
         val user = auth.currentUser ?: return Result.failure(IllegalStateException("Not signed in"))
         val uid = user.uid
@@ -82,6 +83,7 @@ class FamilyRepository(
                     "familyId" to familyId,
                     "deviceId" to deviceId,
                     "language" to language,
+                    "lastSeenPrivacy" to (lastSeenPrivacy ?: "EVERYONE"),
                     "createdAt" to FieldValue.serverTimestamp(),
                     "updatedAt" to FieldValue.serverTimestamp()
                 ).filterValues { it != null } as Map<String, Any>
@@ -97,6 +99,7 @@ class FamilyRepository(
                 user.photoUrl?.toString()?.take(500)?.let { updates["photoUrl"] = it }
                 if (!familyId.isNullOrBlank()) updates["familyId"] = familyId
                 if (!deviceId.isNullOrBlank()) updates["deviceId"] = deviceId
+                if (!lastSeenPrivacy.isNullOrBlank()) updates["lastSeenPrivacy"] = lastSeenPrivacy
                 docRef.update(updates).await()
             }
             Result.success(Unit)
@@ -472,26 +475,51 @@ class FamilyRepository(
         lastLongitude: Double? = null,
         lastAccuracyMeters: Double? = null,
         lastLocationAtMs: Long? = null,
-        lastSyncAtMs: Long? = null
+        lastSyncAtMs: Long? = null,
+        networkConsentGranted: Boolean? = null,
+        networkMonitoringEnabled: Boolean? = null,
+        currentWifiAvailable: Boolean? = null,
+        currentCellularAvailable: Boolean? = null,
+        internetAvailable: Boolean? = null,
+        currentNetworkSessionId: String? = null,
+        currentSessionStartedAtMs: Long? = null,
+        lastNetworkEventType: String? = null,
+        lastNetworkEventAtMs: Long? = null,
+        lastActiveAtMs: Long? = null
     ): Result<Unit> {
         val docRef = db.collection("families").document(familyId).collection("devices").document(deviceId)
         return try {
             requireUserId()
             val nowMs = System.currentTimeMillis()
+            val health = when {
+                batteryPercent <= 15 -> "LOW_BATTERY"
+                !locationPermissionGranted -> "PERM_MISSING"
+                else -> "GOOD"
+            }
             val updates = mutableMapOf<String, Any>(
+                "androidVersion" to "Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})".take(40),
                 "consentGranted" to consentGranted,
                 "locationSharingEnabled" to locationSharingEnabled,
                 "locationPermissionGranted" to locationPermissionGranted,
                 "backgroundPermissionGranted" to backgroundPermissionGranted,
                 "batteryPercent" to batteryPercent.coerceIn(0, 100).toLong(),
                 "networkType" to networkType,
+                "deviceHealth" to health,
                 "online" to online,
                 "lastSeenAtMs" to nowMs,
                 "updatedAt" to FieldValue.serverTimestamp()
             )
-            if (consentGranted) {
-                updates["consentTimestamp"] = FieldValue.serverTimestamp()
-            }
+            if (consentGranted) updates["consentTimestamp"] = FieldValue.serverTimestamp()
+            if (networkConsentGranted != null) updates["networkConsentGranted"] = networkConsentGranted
+            if (networkMonitoringEnabled != null) updates["networkMonitoringEnabled"] = networkMonitoringEnabled
+            if (currentWifiAvailable != null) updates["currentWifiAvailable"] = currentWifiAvailable
+            if (currentCellularAvailable != null) updates["currentCellularAvailable"] = currentCellularAvailable
+            if (internetAvailable != null) updates["internetAvailable"] = internetAvailable
+            if (currentNetworkSessionId != null) updates["currentNetworkSessionId"] = currentNetworkSessionId.take(128)
+            if (currentSessionStartedAtMs != null) updates["currentSessionStartedAtMs"] = currentSessionStartedAtMs
+            if (lastNetworkEventType != null) updates["lastNetworkEventType"] = lastNetworkEventType.take(64)
+            if (lastNetworkEventAtMs != null) updates["lastNetworkEventAtMs"] = lastNetworkEventAtMs
+            if (lastActiveAtMs != null) updates["lastActiveAtMs"] = lastActiveAtMs
             if (lastLatitude != null && lastLongitude != null) {
                 updates["lastLatitude"] = lastLatitude
                 updates["lastLongitude"] = lastLongitude
@@ -511,13 +539,15 @@ class FamilyRepository(
         }
     }
 
-    suspend fun revokeDevice(familyId: String, deviceId: String): Result<Unit> {
+    suspend fun renameDevice(familyId: String, deviceId: String, newName: String): Result<Unit> {
+        val clean = newName.trim().take(80)
+        if (clean.isBlank()) return Result.failure(IllegalArgumentException("Device name cannot be empty"))
         val docRef = db.collection("families").document(familyId).collection("devices").document(deviceId)
         return try {
             requireUserId()
             docRef.update(
                 mapOf(
-                    "revoked" to true,
+                    "deviceName" to clean,
                     "updatedAt" to FieldValue.serverTimestamp()
                 )
             ).await()
@@ -526,6 +556,78 @@ class FamilyRepository(
             throw e
         } catch (e: Exception) {
             handleFirestoreError(e, OperationType.UPDATE, docRef.path)
+            Result.failure(e)
+        }
+    }
+
+    suspend fun setDeviceRevoked(familyId: String, deviceId: String, revoked: Boolean): Result<Unit> {
+        val docRef = db.collection("families").document(familyId).collection("devices").document(deviceId)
+        return try {
+            requireUserId()
+            docRef.update(
+                mapOf(
+                    "revoked" to revoked,
+                    "updatedAt" to FieldValue.serverTimestamp()
+                )
+            ).await()
+            Result.success(Unit)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.UPDATE, docRef.path)
+            Result.failure(e)
+        }
+    }
+
+    suspend fun removeDevice(familyId: String, deviceId: String): Result<Unit> {
+        val docRef = db.collection("families").document(familyId).collection("devices").document(deviceId)
+        return try {
+            requireUserId()
+            docRef.delete().await()
+            Result.success(Unit)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.DELETE, docRef.path)
+            Result.failure(e)
+        }
+    }
+
+    suspend fun revokeDevice(familyId: String, deviceId: String): Result<Unit> =
+        setDeviceRevoked(familyId, deviceId, true)
+
+    suspend fun updateMemberPresence(
+        familyId: String,
+        online: Boolean,
+        lastSeenPrivacy: String? = null,
+        availability: String? = null,
+        typingConversationId: String? = null,
+        typingActivity: String? = null,
+        lastSyncAtMs: Long? = null
+    ): Result<Unit> {
+        val uid = auth.currentUser?.uid ?: return Result.failure(IllegalStateException("Not signed in"))
+        val ref = db.collection("families").document(familyId).collection("members").document(uid)
+        return try {
+            val nowMs = System.currentTimeMillis()
+            val updates = mutableMapOf<String, Any>(
+                "online" to online,
+                "lastSeenAtMs" to nowMs,
+                "lastActiveAtMs" to nowMs,
+                "updatedAt" to FieldValue.serverTimestamp()
+            )
+            if (lastSeenPrivacy != null) updates["lastSeenPrivacy"] = lastSeenPrivacy
+            if (availability != null) updates["availability"] = availability
+            if (typingConversationId != null) updates["typingConversationId"] = typingConversationId.take(128)
+            if (typingActivity != null) {
+                updates["typingActivity"] = typingActivity
+                updates["typingUpdatedAtMs"] = nowMs
+            }
+            if (lastSyncAtMs != null) updates["lastSyncAtMs"] = lastSyncAtMs
+            ref.update(updates).await()
+            Result.success(Unit)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
             Result.failure(e)
         }
     }

@@ -17,6 +17,21 @@ const FAMILY_DEVICE_ID = "dev_family_002";
 
 const [emulatorHost, emulatorPortStr] = (process.env.FIRESTORE_EMULATOR_HOST || "127.0.0.1:8085").split(":");
 const emulatorPort = parseInt(emulatorPortStr, 10);
+const ADMIN_EMAIL = "quixoratech@gmail.com";
+const FAMILY_EMAIL = "nadia@gmail.com";
+const STRANGER_EMAIL = "otheruser@gmail.com";
+
+function adminDbCtx() {
+  return testEnv.authenticatedContext(ADMIN_UID, { email: ADMIN_EMAIL, email_verified: true }).firestore();
+}
+
+function familyDbCtx() {
+  return testEnv.authenticatedContext(FAMILY_UID, { email: FAMILY_EMAIL, email_verified: true }).firestore();
+}
+
+function strangerDbCtx() {
+  return testEnv.authenticatedContext(STRANGER_UID, { email: STRANGER_EMAIL, email_verified: true }).firestore();
+}
 
 function pastDate(msOffset = 2000) {
   return new Date(Date.now() - msOffset);
@@ -118,18 +133,41 @@ test("Unauthenticated user cannot read or write any collection", async () => {
   await assertFails(unauth.collection("pairing_codes").doc("FT123456").get());
 });
 
-test("User profile isolation and ghost field rejection", async () => {
-  const adminDb = testEnv.authenticatedContext(ADMIN_UID).firestore();
-  const familyDb = testEnv.authenticatedContext(FAMILY_UID).firestore();
+test("User profile isolation, Admin email gate, and ghost field rejection", async () => {
+  const adminDb = adminDbCtx();
+  const familyDb = familyDbCtx();
   const t = pastDate();
 
   await assertSucceeds(
     adminDb.collection("users").doc(ADMIN_UID).set({
       userId: ADMIN_UID,
       displayName: "Tariq",
-      email: "admin@familytrack.bd",
+      email: ADMIN_EMAIL,
       role: "ADMIN",
       language: "en",
+      createdAt: t,
+      updatedAt: t,
+    })
+  );
+
+  // Other Gmail accounts CANNOT create an ADMIN profile or create a family
+  await assertFails(
+    familyDb.collection("users").doc(FAMILY_UID).set({
+      userId: FAMILY_UID,
+      displayName: "Nadia",
+      email: FAMILY_EMAIL,
+      role: "ADMIN",
+      language: "en",
+      createdAt: t,
+      updatedAt: t,
+    })
+  );
+  await assertFails(
+    familyDb.collection("families").doc("fam_unauthorized").set({
+      adminUid: FAMILY_UID,
+      adminEmail: FAMILY_EMAIL,
+      name: "Unauthorized Family",
+      memberUids: [FAMILY_UID],
       createdAt: t,
       updatedAt: t,
     })
@@ -148,9 +186,9 @@ test("User profile isolation and ghost field rejection", async () => {
 });
 
 test("Atomic pairing code creation, claim, and one-time expiry enforcement", async () => {
-  const adminDb = testEnv.authenticatedContext(ADMIN_UID).firestore();
-  const familyDb = testEnv.authenticatedContext(FAMILY_UID).firestore();
-  const strangerDb = testEnv.authenticatedContext(STRANGER_UID).firestore();
+  const adminDb = adminDbCtx();
+  const familyDb = familyDbCtx();
+  const strangerDb = strangerDbCtx();
   const t = pastDate(5000);
 
   // Admin creates family
@@ -232,9 +270,9 @@ test("Atomic pairing code creation, claim, and one-time expiry enforcement", asy
 
 test("Admin-only tracking isolation: Family member cannot read other devices or location history", async () => {
   await seedFamilyAndMembers();
-  const adminDb = testEnv.authenticatedContext(ADMIN_UID).firestore();
-  const familyDb = testEnv.authenticatedContext(FAMILY_UID).firestore();
-  const strangerDb = testEnv.authenticatedContext(STRANGER_UID).firestore();
+  const adminDb = adminDbCtx();
+  const familyDb = familyDbCtx();
+  const strangerDb = strangerDbCtx();
 
   // Family member uploads own location record
   await assertSucceeds(
@@ -297,8 +335,8 @@ test("Admin-only tracking isolation: Family member cannot read other devices or 
 
 test("Messaging, Call signaling, and Tic-Tac-Toe turn enforcement", async () => {
   await seedFamilyAndMembers();
-  const adminDb = testEnv.authenticatedContext(ADMIN_UID).firestore();
-  const familyDb = testEnv.authenticatedContext(FAMILY_UID).firestore();
+  const adminDb = adminDbCtx();
+  const familyDb = familyDbCtx();
   const t = pastDate(2000);
 
   // Create conversation & send message
@@ -378,9 +416,9 @@ test("Messaging, Call signaling, and Tic-Tac-Toe turn enforcement", async () => 
 
 test("Family member can self-join existing GROUP conversation but stranger cannot", async () => {
   await seedFamilyAndMembers();
-  const adminDb = testEnv.authenticatedContext(ADMIN_UID).firestore();
-  const familyDb = testEnv.authenticatedContext(FAMILY_UID).firestore();
-  const strangerDb = testEnv.authenticatedContext(STRANGER_UID).firestore();
+  const adminDb = adminDbCtx();
+  const familyDb = familyDbCtx();
+  const strangerDb = strangerDbCtx();
   const t = pastDate(2000);
 
   const convRef = adminDb.collection("families").doc(FAMILY_ID).collection("conversations").doc("conv_group");
@@ -424,3 +462,303 @@ test("Family member can self-join existing GROUP conversation but stranger canno
     })
   );
 });
+
+test("Network activity events & sessions: Admin and owner only, strict immutability and privacy", async () => {
+  await seedFamilyAndMembers();
+  const adminDb = adminDbCtx();
+  const familyDb = familyDbCtx();
+  const strangerDb = strangerDbCtx();
+  const SECOND_FAMILY_UID = "family_uid_second";
+  await testEnv.withSecurityRulesDisabled(async (ctx) => {
+    const db = ctx.firestore();
+    await db.collection("families").doc(FAMILY_ID).update({
+      memberUids: [ADMIN_UID, FAMILY_UID, SECOND_FAMILY_UID],
+    });
+  });
+  const secondFamilyDb = testEnv.authenticatedContext(SECOND_FAMILY_UID, { email: "brother@gmail.com", email_verified: true }).firestore();
+  const t = pastDate(2000);
+  const nowMs = Date.now() - 1000;
+
+  // Family member creates own network session & network event
+  await assertSucceeds(
+    familyDb.collection("families").doc(FAMILY_ID).collection("network_sessions").doc("sess_1").set({
+      familyId: FAMILY_ID,
+      adminUid: ADMIN_UID,
+      ownerUid: FAMILY_UID,
+      deviceId: FAMILY_DEVICE_ID,
+      deviceName: "Infinix SMART 9 HD",
+      networkType: "WIFI",
+      startedAtMs: nowMs,
+      status: "ACTIVE",
+      lastVerifiedAtMs: nowMs,
+      timezoneId: "Asia/Dhaka",
+      createdAt: t,
+      updatedAt: t,
+    })
+  );
+  await assertSucceeds(
+    familyDb.collection("families").doc(FAMILY_ID).collection("network_events").doc("evt_1").set({
+      familyId: FAMILY_ID,
+      adminUid: ADMIN_UID,
+      ownerUid: FAMILY_UID,
+      deviceId: FAMILY_DEVICE_ID,
+      deviceName: "Infinix SMART 9 HD",
+      eventType: "WIFI_AVAILABLE",
+      networkType: "WIFI",
+      connectionState: "CONNECTED",
+      internetAvailable: true,
+      eventTimestampMs: nowMs,
+      detectedAtMs: nowMs,
+      timezoneId: "Asia/Dhaka",
+      timezoneOffsetMinutes: 360,
+      sessionId: "sess_1",
+      uploadedAt: t,
+    })
+  );
+
+  // Admin can read all family network events/sessions
+  await assertSucceeds(
+    adminDb.collection("families").doc(FAMILY_ID).collection("network_events").where("adminUid", "==", ADMIN_UID).get()
+  );
+  await assertSucceeds(
+    adminDb.collection("families").doc(FAMILY_ID).collection("network_sessions").where("adminUid", "==", ADMIN_UID).get()
+  );
+
+  // Another family member (brother) CANNOT read Nadia's network activity!
+  await assertFails(
+    secondFamilyDb.collection("families").doc(FAMILY_ID).collection("network_events").doc("evt_1").get()
+  );
+  await assertFails(
+    secondFamilyDb.collection("families").doc(FAMILY_ID).collection("network_sessions").doc("sess_1").get()
+  );
+  await assertFails(
+    strangerDb.collection("families").doc(FAMILY_ID).collection("network_events").doc("evt_1").get()
+  );
+
+  // Network events are immutable after upload
+  await assertFails(
+    familyDb.collection("families").doc(FAMILY_ID).collection("network_events").doc("evt_1").update({
+      eventType: "INTERNET_UNAVAILABLE",
+    })
+  );
+
+  // Owner can complete own session; another user cannot
+  await assertFails(
+    adminDb.collection("families").doc(FAMILY_ID).collection("network_sessions").doc("sess_1").update({
+      status: "COMPLETED",
+      endedAtMs: nowMs + 500,
+      durationMs: 500,
+      updatedAt: pastDate(100),
+    })
+  );
+  await assertSucceeds(
+    familyDb.collection("families").doc(FAMILY_ID).collection("network_sessions").doc("sess_1").update({
+      status: "COMPLETED",
+      endedAtMs: nowMs + 500,
+      durationMs: 500,
+      lastVerifiedAtMs: nowMs + 500,
+      updatedAt: pastDate(100),
+    })
+  );
+});
+
+test("Rich WhatsApp-style messaging: replies, reactions, edit/delete by sender only, size caps", async () => {
+  await seedFamilyAndMembers();
+  const adminDb = adminDbCtx();
+  const familyDb = familyDbCtx();
+  const t = pastDate(2000);
+  const convRef = adminDb.collection("families").doc(FAMILY_ID).collection("conversations").doc("conv_group");
+  await assertSucceeds(
+    convRef.set({
+      familyId: FAMILY_ID,
+      type: "GROUP",
+      title: "Family Group",
+      participantUids: [ADMIN_UID, FAMILY_UID],
+      lastMessageText: "Assalamu Alaikum",
+      lastMessageType: "TEXT",
+      lastMessageSenderUid: ADMIN_UID,
+      lastMessageAtMs: Date.now() - 1000,
+      createdAt: t,
+      updatedAt: t,
+    })
+  );
+
+  await assertSucceeds(
+    convRef.collection("messages").doc("msg_rich").set({
+      conversationId: "conv_group",
+      familyId: FAMILY_ID,
+      senderUid: ADMIN_UID,
+      senderName: "Tariq Rahman",
+      participantUids: [ADMIN_UID, FAMILY_UID],
+      type: "IMAGE",
+      text: "Home photo",
+      mediaBase64: "abc123base64",
+      mimeType: "image/jpeg",
+      fileName: "home.jpg",
+      fileSizeBytes: 1024,
+      replyToMessageId: "msg_0",
+      replyToPreview: "Earlier msg",
+      clientCreatedAtMs: Date.now() - 1000,
+      status: "SENT",
+      deliveredToUids: [ADMIN_UID],
+      readByUids: [ADMIN_UID],
+      createdAt: t,
+      updatedAt: t,
+    })
+  );
+
+  // Family member can react & mark read
+  const famMsgRef = familyDb.collection("families").doc(FAMILY_ID).collection("conversations").doc("conv_group").collection("messages").doc("msg_rich");
+  await assertSucceeds(
+    famMsgRef.update({
+      status: "READ",
+      deliveredToUids: [ADMIN_UID, FAMILY_UID],
+      readByUids: [ADMIN_UID, FAMILY_UID],
+      reactions: { [FAMILY_UID]: "❤️" },
+      updatedAt: pastDate(400),
+    })
+  );
+
+  // Non-sender CANNOT edit or mark deletedForAll
+  await assertFails(
+    famMsgRef.update({
+      text: "Tampered",
+      editedAtMs: Date.now(),
+      updatedAt: pastDate(300),
+    })
+  );
+
+  // Sender CAN edit & deleteForAll
+  await assertSucceeds(
+    convRef.collection("messages").doc("msg_rich").update({
+      text: "Message deleted",
+      deletedForAll: true,
+      editedAtMs: Date.now(),
+      updatedAt: pastDate(200),
+    })
+  );
+});
+
+test("Family Hub collections: Calendar, Tasks, Expenses (BDT), Notices (Admin-only), and File Vault", async () => {
+  await seedFamilyAndMembers();
+  const adminDb = adminDbCtx();
+  const familyDb = familyDbCtx();
+  const strangerDb = strangerDbCtx();
+  const t = pastDate(2000);
+  const famRef = adminDb.collection("families").doc(FAMILY_ID);
+  const famMemberRef = familyDb.collection("families").doc(FAMILY_ID);
+
+  // Calendar event
+  await assertSucceeds(
+    famMemberRef.collection("calendar_events").doc("cal_1").set({
+      familyId: FAMILY_ID,
+      title: "Doctor Visit",
+      description: "Square Hospital",
+      startAtMs: Date.now() + 86400000,
+      recurrence: "NONE",
+      reminderMinutesBefore: 30,
+      participantUids: [ADMIN_UID, FAMILY_UID],
+      createdByUid: FAMILY_UID,
+      createdByName: "Nadia Rahman",
+      createdAt: t,
+      updatedAt: t,
+    })
+  );
+
+  // Task created by Admin, completed by Family member
+  await assertSucceeds(
+    famRef.collection("tasks").doc("task_1").set({
+      familyId: FAMILY_ID,
+      title: "Buy groceries",
+      assignedToUid: FAMILY_UID,
+      assignedToName: "Nadia Rahman",
+      priority: "HIGH",
+      dueAtMs: Date.now() + 3600000,
+      completed: false,
+      createdByUid: ADMIN_UID,
+      createdByName: "Tariq Rahman",
+      createdAt: t,
+      updatedAt: t,
+    })
+  );
+  await assertSucceeds(
+    famMemberRef.collection("tasks").doc("task_1").update({
+      completed: true,
+      completedAtMs: Date.now(),
+      completedByUid: FAMILY_UID,
+      updatedAt: pastDate(200),
+    })
+  );
+
+  // Expense (BDT)
+  await assertSucceeds(
+    famMemberRef.collection("expenses").doc("exp_1").set({
+      familyId: FAMILY_ID,
+      title: "Bazar",
+      category: "Groceries",
+      amountBdt: 1250.5,
+      paidByUid: FAMILY_UID,
+      paidByName: "Nadia Rahman",
+      expenseDateMs: Date.now(),
+      createdByUid: FAMILY_UID,
+      createdAt: t,
+      updatedAt: t,
+    })
+  );
+
+  // Notice Board: Family member CANNOT create; Admin creates; member marks read
+  await assertFails(
+    famMemberRef.collection("notices").doc("not_1").set({
+      familyId: FAMILY_ID,
+      title: "Fake Notice",
+      body: "Unauthorized",
+      pinned: true,
+      readByUids: [FAMILY_UID],
+      authorUid: FAMILY_UID,
+      authorName: "Nadia",
+      createdAt: t,
+      updatedAt: t,
+    })
+  );
+  await assertSucceeds(
+    famRef.collection("notices").doc("not_1").set({
+      familyId: FAMILY_ID,
+      title: "Eid Trip",
+      body: "Leaving Friday 7 AM",
+      pinned: true,
+      readByUids: [ADMIN_UID],
+      authorUid: ADMIN_UID,
+      authorName: "Tariq Rahman",
+      createdAt: t,
+      updatedAt: t,
+    })
+  );
+  await assertSucceeds(
+    famMemberRef.collection("notices").doc("not_1").update({
+      readByUids: [ADMIN_UID, FAMILY_UID],
+      updatedAt: pastDate(100),
+    })
+  );
+
+  // Vault: access restricted to allowedUids (plus Admin)
+  await assertSucceeds(
+    famRef.collection("vault_files").doc("vf_1").set({
+      familyId: FAMILY_ID,
+      title: "NID Scan",
+      folder: "IDs",
+      fileName: "nid.pdf",
+      mimeType: "application/pdf",
+      fileSizeBytes: 12000,
+      fileBase64: "JVBERi0xLjQ=",
+      uploadedByUid: ADMIN_UID,
+      uploadedByName: "Tariq Rahman",
+      allowedUids: [ADMIN_UID],
+      createdAt: t,
+      updatedAt: t,
+    })
+  );
+  // Family member not in allowedUids cannot read
+  await assertFails(famMemberRef.collection("vault_files").doc("vf_1").get());
+  await assertFails(strangerDb.collection("families").doc(FAMILY_ID).collection("vault_files").doc("vf_1").get());
+});
+

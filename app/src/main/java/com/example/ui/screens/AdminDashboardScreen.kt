@@ -23,11 +23,14 @@ import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.CloudDone
 import androidx.compose.material.icons.filled.CloudOff
 import androidx.compose.material.icons.filled.Devices
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.GpsFixed
 import androidx.compose.material.icons.filled.GpsOff
 import androidx.compose.material.icons.filled.LocationOn
+import androidx.compose.material.icons.filled.NetworkCheck
 import androidx.compose.material.icons.filled.QrCode2
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Timeline
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -38,6 +41,7 @@ import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -78,11 +82,16 @@ fun AdminDashboardScreen(
     onlyDevicesList: Boolean = false,
     onGenerateCode: () -> Unit,
     onSyncNow: () -> Unit,
-    onRevokeDevice: (String) -> Unit
+    onRevokeDevice: (String) -> Unit,
+    onRenameDevice: (String, String) -> Unit = { _, _ -> },
+    onOpenNetworkHistory: () -> Unit = {},
+    onOpenActivityCenter: () -> Unit = {}
 ) {
     val strings = stringsFor(language)
     var showQrDialog by remember { mutableStateOf(false) }
     var revokeTarget by remember { mutableStateOf<PairedDevice?>(null) }
+    var renameTarget by remember { mutableStateOf<PairedDevice?>(null) }
+    var renameDraft by remember { mutableStateOf("") }
 
     val activeDevices = devices.filter { !it.revoked }
     val onlineCount = activeDevices.count { it.online && (System.currentTimeMillis() - it.lastSeenAtMs) < 15 * 60 * 1000L }
@@ -195,6 +204,32 @@ fun AdminDashboardScreen(
                         modifier = Modifier.weight(1f)
                     )
                 }
+                Spacer(Modifier.height(10.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    FilledTonalButton(
+                        onClick = onOpenNetworkHistory,
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("dashboard_open_network_history")
+                    ) {
+                        Icon(Icons.Default.NetworkCheck, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text(strings.navNetworkHistory, maxLines = 1)
+                    }
+                    FilledTonalButton(
+                        onClick = onOpenActivityCenter,
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("dashboard_open_activity_center")
+                    ) {
+                        Icon(Icons.Default.Timeline, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text(strings.navActivityCenter, maxLines = 1)
+                    }
+                }
             }
         } else {
             item {
@@ -243,7 +278,11 @@ fun AdminDashboardScreen(
                     device = device,
                     adminCoordinates = adminCoordinates,
                     language = language,
-                    onRequestRevoke = { revokeTarget = device }
+                    onRequestRevoke = { revokeTarget = device },
+                    onRequestRename = {
+                        renameTarget = device
+                        renameDraft = device.deviceName
+                    }
                 )
             }
         }
@@ -317,6 +356,34 @@ fun AdminDashboardScreen(
             }
         )
     }
+
+    renameTarget?.let { target ->
+        AlertDialog(
+            onDismissRequest = { renameTarget = null },
+            title = { Text("Rename Device") },
+            text = {
+                OutlinedTextField(
+                    value = renameDraft,
+                    onValueChange = { renameDraft = it.take(60) },
+                    label = { Text("Device Name") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        onRenameDevice(target.id, renameDraft)
+                        renameTarget = null
+                    },
+                    enabled = renameDraft.isNotBlank()
+                ) { Text("Save") }
+            },
+            dismissButton = {
+                TextButton(onClick = { renameTarget = null }) { Text("Cancel") }
+            }
+        )
+    }
 }
 
 @Composable
@@ -355,7 +422,8 @@ fun DeviceStatusCard(
     device: PairedDevice,
     adminCoordinates: Pair<Double, Double>?,
     language: String,
-    onRequestRevoke: () -> Unit
+    onRequestRevoke: () -> Unit,
+    onRequestRename: () -> Unit = {}
 ) {
     val strings = stringsFor(language)
     val nowMs = System.currentTimeMillis()
@@ -380,9 +448,18 @@ fun DeviceStatusCard(
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(modifier = Modifier.weight(1f)) {
-                    Text(device.deviceName, style = MaterialTheme.typography.titleMedium)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(device.deviceName, style = MaterialTheme.typography.titleMedium)
+                        androidx.compose.material3.IconButton(
+                            onClick = onRequestRename,
+                            modifier = Modifier.size(30.dp)
+                        ) {
+                            Icon(Icons.Default.Edit, contentDescription = "Rename device", modifier = Modifier.size(16.dp))
+                        }
+                    }
                     Text(
-                        "${device.ownerName} • ${device.deviceModel}",
+                        "${device.ownerName} • ${device.deviceModel}" +
+                            if (device.androidVersion.isNotBlank()) " • ${device.androidVersion}" else "",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )

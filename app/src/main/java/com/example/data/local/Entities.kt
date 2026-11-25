@@ -68,10 +68,16 @@ data class PendingMessageEntity(
     val senderUid: String,
     val senderName: String,
     val participantUidsCsv: String,
-    val type: String, // "TEXT" or "VOICE"
+    val type: String, // "TEXT", "VOICE", "IMAGE", "DOCUMENT"
     val text: String,
     val voiceFilePath: String? = null,
     val voiceDurationMs: Long = 0L,
+    val mediaFilePath: String? = null,
+    val fileName: String? = null,
+    val mimeType: String? = null,
+    val fileSizeBytes: Long = 0L,
+    val replyToMessageId: String? = null,
+    val replyToPreview: String? = null,
     val clientCreatedAtMs: Long,
     val synced: Boolean = false,
     val syncAttempts: Int = 0,
@@ -100,7 +106,7 @@ data class ConsentLogEntity(
     val userId: String,
     val familyId: String,
     val deviceId: String,
-    val action: String, // "GRANTED", "PAUSED", "RESUMED", "REVOKED"
+    val action: String, // "GRANTED", "PAUSED", "RESUMED", "REVOKED", "NETWORK_GRANTED", "NETWORK_PAUSED"
     val details: String,
     val timestampMs: Long
 )
@@ -120,5 +126,61 @@ data class AppNotificationEntity(
     val body: String,
     val type: String,
     val createdAtMs: Long,
-    val seen: Boolean = false
+    val seen: Boolean = false,
+    val familyId: String = "",
+    val category: String = "GENERAL"
+)
+
+@Entity(
+    tableName = "network_events",
+    indices = [
+        Index(value = ["synced", "detectedAtMs"]),
+        Index(value = ["deviceId", "detectedAtMs"])
+    ]
+)
+data class NetworkEventEntity(
+    @PrimaryKey val id: String,
+    val familyId: String,
+    val adminUid: String,
+    val ownerUid: String,
+    val deviceId: String,
+    val deviceName: String,
+    val eventType: String,
+    val networkType: String,
+    val connectionState: String,
+    val internetAvailable: Boolean,
+    val eventTimestampMs: Long,
+    val detectedAtMs: Long,
+    val timezoneId: String,
+    val timezoneOffsetMinutes: Int,
+    val sessionId: String? = null,
+    val details: String? = null,
+    val synced: Boolean = false,
+    val syncAttempts: Int = 0,
+    val lastError: String? = null
+)
+
+@Entity(
+    tableName = "network_sessions",
+    indices = [
+        Index(value = ["synced", "startedAtMs"]),
+        Index(value = ["deviceId", "startedAtMs"])
+    ]
+)
+data class NetworkSessionEntity(
+    @PrimaryKey val id: String,
+    val familyId: String,
+    val adminUid: String,
+    val ownerUid: String,
+    val deviceId: String,
+    val deviceName: String,
+    val networkType: String,
+    val startedAtMs: Long,
+    val endedAtMs: Long? = null,
+    val durationMs: Long? = null,
+    val status: String, // "ACTIVE", "COMPLETED", "INTERRUPTED", "UNKNOWN"
+    val lastVerifiedAtMs: Long,
+    val interruptionReason: String? = null,
+    val timezoneId: String,
+    val synced: Boolean = false
 )

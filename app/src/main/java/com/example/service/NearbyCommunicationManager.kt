@@ -14,6 +14,7 @@ import android.net.wifi.p2p.WifiP2pDevice
 import android.net.wifi.p2p.WifiP2pManager
 import android.os.Build
 import android.os.Looper
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -97,7 +98,12 @@ class NearbyCommunicationManager(private val context: Context) {
                 }
                 _peers.value = (_peers.value + bonded).distinctBy { it.address }
                 if (!receiverRegistered) {
-                    context.registerReceiver(btReceiver, IntentFilter(BluetoothDevice.ACTION_FOUND))
+                    ContextCompat.registerReceiver(
+                        context.applicationContext,
+                        btReceiver,
+                        IntentFilter(BluetoothDevice.ACTION_FOUND),
+                        ContextCompat.RECEIVER_EXPORTED
+                    )
                     receiverRegistered = true
                 }
                 adapter.startDiscovery()
@@ -112,7 +118,7 @@ class NearbyCommunicationManager(private val context: Context) {
         if (p2p != null) {
             runCatching {
                 if (wifiChannel == null) {
-                    wifiChannel = p2p.initialize(context, Looper.getMainLooper(), null)
+                    wifiChannel = p2p.initialize(context.applicationContext, Looper.getMainLooper(), null)
                 }
                 wifiChannel?.let { channel ->
                     p2p.discoverPeers(channel, object : WifiP2pManager.ActionListener {
@@ -224,7 +230,7 @@ class NearbyCommunicationManager(private val context: Context) {
         runCatching { serverSocket?.close() }
         serverSocket = null
         if (receiverRegistered) {
-            runCatching { context.unregisterReceiver(btReceiver) }
+            runCatching { context.applicationContext.unregisterReceiver(btReceiver) }
             receiverRegistered = false
         }
     }

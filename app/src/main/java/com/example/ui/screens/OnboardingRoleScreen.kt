@@ -38,9 +38,11 @@ import androidx.compose.material.icons.filled.FamilyRestroom
 import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material.icons.filled.VerifiedUser
+import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
@@ -74,6 +76,8 @@ import java.util.concurrent.Executors
 @Composable
 fun OnboardingRoleScreen(
     language: String,
+    allowedAdminEmail: Boolean,
+    signedInEmail: String = "",
     isBusy: Boolean,
     bannerError: String?,
     onClearError: () -> Unit,
@@ -82,7 +86,9 @@ fun OnboardingRoleScreen(
 ) {
     val strings = stringsFor(language)
     val context = LocalContext.current
-    var selectedRole by remember { mutableStateOf<String?>(null) }
+    var selectedRole by remember(allowedAdminEmail) {
+        mutableStateOf(if (allowedAdminEmail) "ADMIN" else "FAMILY")
+    }
     var familyName by remember { mutableStateOf("") }
     var pairingCode by remember { mutableStateOf("") }
     var deviceName by remember { mutableStateOf("${Build.MANUFACTURER} ${Build.MODEL}".trim()) }
@@ -115,16 +121,34 @@ fun OnboardingRoleScreen(
                 .widthIn(max = 580.dp)
         ) {
             Text(
-                text = strings.chooseRoleTitle,
+                text = if (allowedAdminEmail) strings.chooseRoleTitle else strings.familyModeTitle,
                 style = MaterialTheme.typography.headlineMedium,
                 color = MaterialTheme.colorScheme.onBackground
             )
             Spacer(Modifier.height(6.dp))
             Text(
-                text = strings.chooseRoleSubtitle,
+                text = if (allowedAdminEmail) strings.chooseRoleSubtitle else strings.pairDeviceDesc,
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+            if (signedInEmail.isNotBlank()) {
+                Spacer(Modifier.height(6.dp))
+                Surface(
+                    color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.6f),
+                    shape = MaterialTheme.shapes.small
+                ) {
+                    Text(
+                        text = if (allowedAdminEmail) {
+                            "Admin verified: $signedInEmail"
+                        } else {
+                            "Signed in as: $signedInEmail (Family Mode)"
+                        },
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                    )
+                }
+            }
             Spacer(Modifier.height(18.dp))
 
             val activeError = bannerError ?: cameraDeniedMessage
@@ -156,43 +180,45 @@ fun OnboardingRoleScreen(
                 }
             }
 
-            // Admin Card
-            Card(
-                onClick = { selectedRole = "ADMIN" },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .testTag("select_admin_role_card"),
-                border = if (selectedRole == "ADMIN") BorderStroke(2.dp, MaterialTheme.colorScheme.primary) else null,
-                colors = CardDefaults.cardColors(
-                    containerColor = if (selectedRole == "ADMIN")
-                        MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.55f)
-                    else MaterialTheme.colorScheme.surface
-                )
-            ) {
-                Row(
-                    modifier = Modifier.padding(16.dp),
-                    verticalAlignment = Alignment.Top
-                ) {
-                    Icon(
-                        Icons.Default.AdminPanelSettings,
-                        contentDescription = strings.adminModeTitle,
-                        tint = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(32.dp)
+            // Admin Card ONLY shown when logged in with authorized Admin Gmail
+            if (allowedAdminEmail) {
+                Card(
+                    onClick = { selectedRole = "ADMIN" },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("select_admin_role_card"),
+                    border = if (selectedRole == "ADMIN") BorderStroke(2.dp, MaterialTheme.colorScheme.primary) else null,
+                    colors = CardDefaults.cardColors(
+                        containerColor = if (selectedRole == "ADMIN")
+                            MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.55f)
+                        else MaterialTheme.colorScheme.surface
                     )
-                    Spacer(Modifier.width(14.dp))
-                    Column {
-                        Text(strings.adminModeTitle, style = MaterialTheme.typography.titleMedium)
-                        Spacer(Modifier.height(4.dp))
-                        Text(
-                            strings.adminModeDesc,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                ) {
+                    Row(
+                        modifier = Modifier.padding(16.dp),
+                        verticalAlignment = Alignment.Top
+                    ) {
+                        Icon(
+                            Icons.Default.AdminPanelSettings,
+                            contentDescription = strings.adminModeTitle,
+                            tint = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.size(32.dp)
                         )
+                        Spacer(Modifier.width(14.dp))
+                        Column {
+                            Text(strings.adminModeTitle, style = MaterialTheme.typography.titleMedium)
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                strings.adminModeDesc,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
                     }
                 }
-            }
 
-            Spacer(Modifier.height(12.dp))
+                Spacer(Modifier.height(12.dp))
+            }
 
             // Family Card
             Card(
@@ -232,7 +258,7 @@ fun OnboardingRoleScreen(
 
             Spacer(Modifier.height(22.dp))
 
-            if (selectedRole == "ADMIN") {
+            if (allowedAdminEmail && selectedRole == "ADMIN") {
                 Card(modifier = Modifier.fillMaxWidth()) {
                     Column(modifier = Modifier.padding(16.dp)) {
                         Text(strings.createFamilyTitle, style = MaterialTheme.typography.titleMedium)
@@ -457,10 +483,12 @@ fun ConsentAndPermissionsScreen(
     language: String,
     isAdmin: Boolean,
     onAgreeAndStart: () -> Unit,
-    onSkipLocation: () -> Unit
+    onSkipLocation: () -> Unit,
+    onAgreeAndStartWithOptions: ((enableLocation: Boolean, enableNetwork: Boolean) -> Unit)? = null
 ) {
     val strings = stringsFor(language)
     val context = LocalContext.current
+    var networkConsentChecked by remember { mutableStateOf(true) }
     var hasFgLocation by remember {
         mutableStateOf(LocationCaptureHelper.hasForegroundLocationPermission(context))
     }
@@ -618,10 +646,56 @@ fun ConsentAndPermissionsScreen(
                 }
             }
 
+            Spacer(Modifier.height(14.dp))
+
+            // Background Network Activity Consent Toggle
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(14.dp),
+                    verticalAlignment = Alignment.Top
+                ) {
+                    Checkbox(
+                        checked = networkConsentChecked,
+                        onCheckedChange = { networkConsentChecked = it },
+                        modifier = Modifier.testTag("consent_network_checkbox")
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                Icons.Default.Wifi,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                "Background Network Activity Monitoring (Consent-Based)",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                        Text(
+                            "Records Wi-Fi, Mobile Data, validated Internet availability transitions, and sync status for the Family Admin — even while the app is closed. Never accesses websites visited, browsing data, or private message content. You can pause anytime in Settings.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+
             Spacer(Modifier.height(20.dp))
 
             Button(
-                onClick = onAgreeAndStart,
+                onClick = {
+                    if (onAgreeAndStartWithOptions != null) {
+                        onAgreeAndStartWithOptions(true, networkConsentChecked)
+                    } else {
+                        onAgreeAndStart()
+                    }
+                },
                 enabled = hasFgLocation,
                 modifier = Modifier
                     .fillMaxWidth()

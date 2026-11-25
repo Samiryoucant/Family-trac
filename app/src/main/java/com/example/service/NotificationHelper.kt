@@ -19,6 +19,7 @@ object NotificationHelper {
     const val CHANNEL_MESSAGES = "familytrack_messages"
     const val CHANNEL_CALLS = "familytrack_calls"
     const val CHANNEL_GAMES = "familytrack_games"
+    const val CHANNEL_HUB = "familytrack_hub"
     const val NOTIF_ID_LOCATION_FGS = 1001
 
     fun ensureChannels(context: Context) {
@@ -54,6 +55,13 @@ object NotificationHelper {
                 NotificationManager.IMPORTANCE_DEFAULT
             ).apply {
                 description = context.getString(R.string.notif_channel_games_desc)
+            },
+            NotificationChannel(
+                CHANNEL_HUB,
+                context.getString(R.string.notif_channel_hub_name),
+                NotificationManager.IMPORTANCE_DEFAULT
+            ).apply {
+                description = context.getString(R.string.notif_channel_hub_desc)
             }
         )
         channels.forEach { nm.createNotificationChannel(it) }

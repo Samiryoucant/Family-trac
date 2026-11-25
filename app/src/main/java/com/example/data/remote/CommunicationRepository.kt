@@ -126,6 +126,12 @@ class CommunicationRepository(
         text: String,
         voiceAudioBase64: String? = null,
         voiceDurationMs: Long? = null,
+        mediaBase64: String? = null,
+        fileName: String? = null,
+        mimeType: String? = null,
+        fileSizeBytes: Long? = null,
+        replyToMessageId: String? = null,
+        replyToPreview: String? = null,
         clientCreatedAtMs: Long = System.currentTimeMillis()
     ): Result<Unit> {
         val convRef = db.collection("families").document(familyId).collection("conversations").document(conversationId)
@@ -143,14 +149,27 @@ class CommunicationRepository(
                 "text" to text.take(2000),
                 "voiceAudioBase64" to voiceAudioBase64,
                 "voiceDurationMs" to voiceDurationMs,
+                "mediaBase64" to mediaBase64,
+                "fileName" to fileName?.take(160),
+                "mimeType" to mimeType?.take(120),
+                "fileSizeBytes" to fileSizeBytes,
+                "replyToMessageId" to replyToMessageId?.take(128),
+                "replyToPreview" to replyToPreview?.take(200),
+                "deletedForAll" to false,
                 "clientCreatedAtMs" to clientCreatedAtMs,
                 "status" to "SENT",
+                "deliveredToUids" to listOf(uid),
                 "readByUids" to listOf(uid),
                 "createdAt" to FieldValue.serverTimestamp(),
                 "updatedAt" to FieldValue.serverTimestamp()
             ).filterValues { it != null } as Map<String, Any>
 
-            val preview = if (type == "VOICE") "Voice message (${((voiceDurationMs ?: 0L) / 1000L)}s)" else text.take(120)
+            val preview = when (type) {
+                "VOICE" -> "Voice message (${((voiceDurationMs ?: 0L) / 1000L)}s)"
+                "IMAGE" -> if (text.isNotBlank()) "📷 $text".take(120) else "📷 Photo"
+                "DOCUMENT" -> "📄 ${fileName ?: "Document"}".take(120)
+                else -> text.take(120)
+            }
 
             try {
                 db.runBatch { batch ->
@@ -184,6 +203,22 @@ class CommunicationRepository(
         }
     }
 
+    suspend fun markMessageDelivered(familyId: String, conversationId: String, messageId: String): Result<Unit> {
+        val msgRef = db.collection("families").document(familyId)
+            .collection("conversations").document(conversationId)
+            .collection("messages").document(messageId)
+        return runCatching {
+            val uid = requireUserId()
+            msgRef.update(
+                mapOf(
+                    "status" to "DELIVERED",
+                    "deliveredToUids" to FieldValue.arrayUnion(uid),
+                    "updatedAt" to FieldValue.serverTimestamp()
+                )
+            ).await()
+        }.map { }
+    }
+
     suspend fun markMessageRead(familyId: String, conversationId: String, messageId: String): Result<Unit> {
         val msgRef = db.collection("families").document(familyId)
             .collection("conversations").document(conversationId)
@@ -193,6 +228,7 @@ class CommunicationRepository(
             msgRef.update(
                 mapOf(
                     "status" to "READ",
+                    "deliveredToUids" to FieldValue.arrayUnion(uid),
                     "readByUids" to FieldValue.arrayUnion(uid),
                     "updatedAt" to FieldValue.serverTimestamp()
                 )
@@ -202,6 +238,116 @@ class CommunicationRepository(
             throw e
         } catch (e: Exception) {
             handleFirestoreError(e, OperationType.UPDATE, msgRef.path)
+            Result.failure(e)
+        }
+    }
+
+    suspend fun toggleReaction(
+        familyId: String,
+        conversationId: String,
+        message: ChatMessage,
+        emoji: String
+    ): Result<Unit> {
+        val msgRef = db.collection("families").document(familyId)
+            .collection("conversations").document(conversationId)
+            .collection("messages").document(message.id)
+        return try {
+            val uid = requireUserId()
+            val next = message.reactions.toMutableMap()
+            if (next[uid] == emoji) next.remove(uid) else next[uid] = emoji
+            msgRef.update(
+                mapOf(
+                    "reactions" to next,
+                    "updatedAt" to FieldValue.serverTimestamp()
+                )
+            ).await()
+            Result.success(Unit)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.UPDATE, msgRef.path)
+            Result.failure(e)
+        }
+    }
+
+    suspend fun editMessageText(
+        familyId: String,
+        conversationId: String,
+        messageId: String,
+        newText: String
+    ): Result<Unit> {
+        val clean = newText.trim().take(2000)
+        if (clean.isBlank()) return Result.failure(IllegalArgumentException("Message cannot be empty"))
+        val msgRef = db.collection("families").document(familyId)
+            .collection("conversations").document(conversationId)
+            .collection("messages").document(messageId)
+        return try {
+            requireUserId()
+            msgRef.update(
+                mapOf(
+                    "text" to clean,
+                    "editedAtMs" to System.currentTimeMillis(),
+                    "updatedAt" to FieldValue.serverTimestamp()
+                )
+            ).await()
+            Result.success(Unit)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.UPDATE, msgRef.path)
+            Result.failure(e)
+        }
+    }
+
+    suspend fun deleteMessageForAll(
+        familyId: String,
+        conversationId: String,
+        messageId: String
+    ): Result<Unit> {
+        val msgRef = db.collection("families").document(familyId)
+            .collection("conversations").document(conversationId)
+            .collection("messages").document(messageId)
+        return try {
+            requireUserId()
+            msgRef.update(
+                mapOf(
+                    "text" to "This message was deleted",
+                    "deletedForAll" to true,
+                    "editedAtMs" to System.currentTimeMillis(),
+                    "updatedAt" to FieldValue.serverTimestamp()
+                )
+            ).await()
+            Result.success(Unit)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.UPDATE, msgRef.path)
+            Result.failure(e)
+        }
+    }
+
+    suspend fun toggleConversationFlag(
+        familyId: String,
+        conversationId: String,
+        fieldName: String, // pinnedByUids | mutedByUids | archivedByUids
+        enable: Boolean
+    ): Result<Unit> {
+        val convRef = db.collection("families").document(familyId)
+            .collection("conversations").document(conversationId)
+        return try {
+            val uid = requireUserId()
+            val op = if (enable) FieldValue.arrayUnion(uid) else FieldValue.arrayRemove(uid)
+            convRef.update(
+                mapOf(
+                    fieldName to op,
+                    "updatedAt" to FieldValue.serverTimestamp()
+                )
+            ).await()
+            Result.success(Unit)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            handleFirestoreError(e, OperationType.UPDATE, convRef.path)
             Result.failure(e)
         }
     }
