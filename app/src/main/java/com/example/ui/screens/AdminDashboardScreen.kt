@@ -1,5 +1,9 @@
 package com.example.ui.screens
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.widget.Toast
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -16,14 +20,19 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.BatteryChargingFull
 import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.CloudDone
 import androidx.compose.material.icons.filled.CloudOff
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Devices
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.GpsFixed
 import androidx.compose.material.icons.filled.GpsOff
 import androidx.compose.material.icons.filled.LocationOn
@@ -37,8 +46,10 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -53,21 +64,28 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.example.data.local.SyncStatusEntity
 import com.example.data.model.FamilyGroup
 import com.example.data.model.PairedDevice
 import com.example.data.model.PairingCode
 import com.example.service.LocationCaptureHelper
+import com.example.service.QRCodeDiagnosticResult
+import com.example.service.QRCodeDiagnosticService
 import com.example.service.QrCodeHelper
+import com.example.service.QrDiagnosticLogger
 import com.example.ui.i18n.stringsFor
 import com.example.ui.theme.MonoFontFamily
 import com.example.ui.theme.StatusLiveGreen
 import com.example.ui.theme.StatusOfflineSlate
 import com.example.ui.theme.StatusStaleAmber
+import com.example.ui.viewmodel.PairingCodeUiState
 
 @Composable
 fun AdminDashboardScreen(
@@ -85,8 +103,11 @@ fun AdminDashboardScreen(
     onRevokeDevice: (String) -> Unit,
     onRenameDevice: (String, String) -> Unit = { _, _ -> },
     onOpenNetworkHistory: () -> Unit = {},
-    onOpenActivityCenter: () -> Unit = {}
+    onOpenActivityCenter: () -> Unit = {},
+    pairingCodeUiState: PairingCodeUiState = PairingCodeUiState.Idle,
+    onRetryGenerateCode: () -> Unit = onGenerateCode
 ) {
+    val context = LocalContext.current
     val strings = stringsFor(language)
     var showQrDialog by remember { mutableStateOf(false) }
     var revokeTarget by remember { mutableStateOf<PairedDevice?>(null) }
@@ -289,8 +310,19 @@ fun AdminDashboardScreen(
     }
 
     if (showQrDialog) {
-        val qrBitmap = remember(latestCode?.code) {
-            latestCode?.code?.let { QrCodeHelper.generateQrBitmap("FAMILYTRACK:$it", 480) }
+        val readyCode = (pairingCodeUiState as? PairingCodeUiState.Ready)?.code
+        val effectiveCode = readyCode ?: latestCode
+        val syncedToCloud = (pairingCodeUiState as? PairingCodeUiState.Ready)?.syncedToCloud ?: true
+        val qrResult = remember(effectiveCode?.code) {
+            effectiveCode?.code?.let { QrCodeHelper.generateQrBitmapWithDiagnostics("FAMILYTRACK:$it", 480) }
+        }
+        val qrBitmap = qrResult?.bitmap
+        var selfTestResult by remember(effectiveCode?.code) { mutableStateOf<QRCodeDiagnosticResult?>(null) }
+        var showDiagnostics by remember(effectiveCode?.code, pairingCodeUiState) {
+            mutableStateOf(
+                pairingCodeUiState is PairingCodeUiState.Error ||
+                    (effectiveCode != null && qrResult?.bitmap == null)
+            )
         }
         AlertDialog(
             onDismissRequest = { showQrDialog = false },
@@ -298,40 +330,277 @@ fun AdminDashboardScreen(
             text = {
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
-                    modifier = Modifier.fillMaxWidth()
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .verticalScroll(rememberScrollState())
                 ) {
-                    if (qrBitmap != null) {
-                        Image(
-                            bitmap = qrBitmap.asImageBitmap(),
-                            contentDescription = "Pairing QR Code",
-                            modifier = Modifier.size(210.dp)
-                        )
-                        Spacer(Modifier.height(12.dp))
-                        Surface(
-                            color = MaterialTheme.colorScheme.primaryContainer,
-                            shape = MaterialTheme.shapes.small
-                        ) {
+                    when (pairingCodeUiState) {
+                        is PairingCodeUiState.Generating -> {
+                            Spacer(Modifier.height(8.dp))
+                            CircularProgressIndicator(
+                                modifier = Modifier
+                                    .size(40.dp)
+                                    .testTag("qr_loading_spinner")
+                            )
+                            Spacer(Modifier.height(12.dp))
                             Text(
-                                text = latestCode?.code.orEmpty(),
-                                style = MaterialTheme.typography.headlineSmall.copy(fontFamily = MonoFontFamily),
-                                color = MaterialTheme.colorScheme.onPrimaryContainer,
-                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                                text = "Generating one-time pairing code...",
+                                style = MaterialTheme.typography.bodyMedium,
+                                textAlign = TextAlign.Center
                             )
                         }
+                        is PairingCodeUiState.Error -> {
+                            Surface(
+                                color = MaterialTheme.colorScheme.errorContainer,
+                                shape = MaterialTheme.shapes.medium,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(
+                                    modifier = Modifier.padding(14.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Icon(
+                                        Icons.Default.ErrorOutline,
+                                        contentDescription = "Pairing code error",
+                                        tint = MaterialTheme.colorScheme.onErrorContainer,
+                                        modifier = Modifier.size(32.dp)
+                                    )
+                                    Text(
+                                        text = pairingCodeUiState.message,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = MaterialTheme.colorScheme.onErrorContainer,
+                                        textAlign = TextAlign.Center
+                                    )
+                                }
+                            }
+                            Spacer(Modifier.height(12.dp))
+                            Button(
+                                onClick = onRetryGenerateCode,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("qr_retry_button")
+                            ) {
+                                Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text("Retry")
+                            }
+                        }
+                        else -> {
+                            if (effectiveCode != null) {
+                                if (qrBitmap != null) {
+                                    Surface(
+                                        color = Color.White,
+                                        shape = RoundedCornerShape(12.dp),
+                                        tonalElevation = 2.dp,
+                                        shadowElevation = 2.dp
+                                    ) {
+                                        Image(
+                                            bitmap = qrBitmap.asImageBitmap(),
+                                            contentDescription = "Pairing QR Code",
+                                            modifier = Modifier
+                                                .padding(12.dp)
+                                                .size(200.dp)
+                                                .testTag("pairing_qr_image")
+                                        )
+                                    }
+                                    Spacer(Modifier.height(12.dp))
+                                } else {
+                                    Surface(
+                                        color = MaterialTheme.colorScheme.errorContainer,
+                                        shape = MaterialTheme.shapes.medium,
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .testTag("qr_bitmap_error_card")
+                                    ) {
+                                        Column(
+                                            modifier = Modifier.padding(12.dp),
+                                            horizontalAlignment = Alignment.CenterHorizontally,
+                                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                                        ) {
+                                            Icon(
+                                                Icons.Default.ErrorOutline,
+                                                contentDescription = "QR graphic creation error",
+                                                tint = MaterialTheme.colorScheme.onErrorContainer
+                                            )
+                                            Text(
+                                                text = qrResult?.errorMessage ?: "QR bitmap creation failed.",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onErrorContainer,
+                                                textAlign = TextAlign.Center
+                                            )
+                                        }
+                                    }
+                                    Spacer(Modifier.height(12.dp))
+                                }
+                                Surface(
+                                    color = MaterialTheme.colorScheme.primaryContainer,
+                                    shape = MaterialTheme.shapes.small
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.padding(start = 16.dp, end = 4.dp, top = 4.dp, bottom = 4.dp)
+                                    ) {
+                                        Text(
+                                            text = effectiveCode.code,
+                                            style = MaterialTheme.typography.headlineSmall.copy(fontFamily = MonoFontFamily),
+                                            color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                            modifier = Modifier.testTag("pairing_code_text")
+                                        )
+                                        Spacer(Modifier.width(6.dp))
+                                        IconButton(
+                                            onClick = {
+                                                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                                                cm?.setPrimaryClip(ClipData.newPlainText("Pairing Code", effectiveCode.code))
+                                                Toast.makeText(context, "Pairing code copied", Toast.LENGTH_SHORT).show()
+                                            },
+                                            modifier = Modifier.testTag("copy_pairing_code_button")
+                                        ) {
+                                            Icon(
+                                                Icons.Default.ContentCopy,
+                                                contentDescription = "Copy pairing code",
+                                                tint = MaterialTheme.colorScheme.onPrimaryContainer
+                                            )
+                                        }
+                                    }
+                                }
+                                Spacer(Modifier.height(8.dp))
+                                Surface(
+                                    color = if (syncedToCloud) StatusLiveGreen.copy(alpha = 0.14f) else StatusStaleAmber.copy(alpha = 0.18f),
+                                    shape = MaterialTheme.shapes.small
+                                ) {
+                                    Text(
+                                        text = if (syncedToCloud) {
+                                            "Synced to cloud • Ready to scan"
+                                        } else {
+                                            "Saved offline • Waiting for internet to sync..."
+                                        },
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = if (syncedToCloud) StatusLiveGreen else StatusStaleAmber,
+                                        textAlign = TextAlign.Center,
+                                        modifier = Modifier
+                                            .padding(horizontal = 10.dp, vertical = 4.dp)
+                                            .testTag("pairing_sync_badge")
+                                    )
+                                }
+                                Spacer(Modifier.height(6.dp))
+                                Text(
+                                    text = strings.codeExpiresNote,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    textAlign = TextAlign.Center
+                                )
+                            } else {
+                                Spacer(Modifier.height(8.dp))
+                                CircularProgressIndicator(
+                                    modifier = Modifier
+                                        .size(36.dp)
+                                        .testTag("qr_loading_spinner")
+                                )
+                                Spacer(Modifier.height(10.dp))
+                                Text(
+                                    text = "Preparing pairing code...",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    textAlign = TextAlign.Center
+                                )
+                                Spacer(Modifier.height(10.dp))
+                                Button(
+                                    onClick = onRetryGenerateCode,
+                                    modifier = Modifier.testTag("qr_retry_button")
+                                ) {
+                                    Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+                                    Spacer(Modifier.width(6.dp))
+                                    Text("Retry")
+                                }
+                            }
+                        }
+                    }
+
+                    if (pairingCodeUiState !is PairingCodeUiState.Generating) {
                         Spacer(Modifier.height(8.dp))
-                        Text(
-                            strings.codeExpiresNote,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    } else {
-                        Text("Generating one-time pairing code...")
+                        val diagnosticText = remember(qrResult?.diagnosticReport, pairingCodeUiState, showDiagnostics, selfTestResult) {
+                            selfTestResult?.logSummary?.takeIf { it.isNotBlank() }
+                                ?: qrResult?.diagnosticReport
+                                ?: QrDiagnosticLogger.formatReport()
+                        }
+                        TextButton(
+                            onClick = { showDiagnostics = !showDiagnostics },
+                            modifier = Modifier.testTag("qr_toggle_diagnostics_button")
+                        ) {
+                            Text(if (showDiagnostics) "Hide Diagnostics" else "Show Diagnostics")
+                        }
+                        if (showDiagnostics) {
+                            Surface(
+                                color = MaterialTheme.colorScheme.surfaceVariant,
+                                shape = MaterialTheme.shapes.small,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(modifier = Modifier.padding(10.dp)) {
+                                    selfTestResult?.let { res ->
+                                        Text(
+                                            text = if (res.passed) {
+                                                "Self-Test PASSED: ${res.bitmapWidth}x${res.bitmapHeight}px (${res.durationMs}ms)"
+                                            } else {
+                                                "Self-Test FAILED (${res.errorType ?: "Error"}): ${res.specificErrorMessage.orEmpty()}"
+                                            },
+                                            style = MaterialTheme.typography.labelMedium,
+                                            color = if (res.passed) StatusLiveGreen else MaterialTheme.colorScheme.error,
+                                            modifier = Modifier
+                                                .padding(bottom = 6.dp)
+                                                .testTag("qr_selftest_result_text")
+                                        )
+                                    }
+                                    Text(
+                                        text = diagnosticText,
+                                        style = MaterialTheme.typography.labelSmall.copy(fontFamily = MonoFontFamily),
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.testTag("qr_diagnostic_log_text")
+                                    )
+                                    Spacer(Modifier.height(6.dp))
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        TextButton(
+                                            onClick = {
+                                                selfTestResult = QRCodeDiagnosticService.runSelfTest()
+                                            },
+                                            modifier = Modifier.testTag("qr_run_selftest_button")
+                                        ) {
+                                            Text("Run Self-Test")
+                                        }
+                                        TextButton(
+                                            onClick = {
+                                                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                                                cm?.setPrimaryClip(ClipData.newPlainText("QR Diagnostics", diagnosticText))
+                                                Toast.makeText(context, "Diagnostic log copied", Toast.LENGTH_SHORT).show()
+                                            },
+                                            modifier = Modifier.testTag("qr_copy_diagnostics_button")
+                                        ) {
+                                            Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(14.dp))
+                                            Spacer(Modifier.width(4.dp))
+                                            Text("Copy Log")
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             },
             confirmButton = {
                 TextButton(onClick = { showQrDialog = false }) {
                     Text("Done")
+                }
+            },
+            dismissButton = {
+                if (pairingCodeUiState !is PairingCodeUiState.Generating) {
+                    TextButton(
+                        onClick = onRetryGenerateCode,
+                        modifier = Modifier.testTag("qr_new_code_button")
+                    ) {
+                        Text("New Code")
+                    }
                 }
             }
         )

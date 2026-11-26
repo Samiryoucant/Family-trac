@@ -45,6 +45,8 @@ import com.example.service.NearbyPacket
 import com.example.service.NearbyPeer
 import com.example.service.NetworkActivityMonitor
 import com.example.service.NotificationHelper
+import com.example.service.QrDiagnosticLogger
+import com.example.service.QrDiagnosticStage
 import com.example.service.SyncScheduler
 import com.example.service.VoiceRecorderPlayer
 import com.example.service.WebRtcCallManager
@@ -77,6 +79,13 @@ sealed interface UiState<out T> {
     data class Error(val message: String) : UiState<Nothing>
 }
 
+sealed interface PairingCodeUiState {
+    data object Idle : PairingCodeUiState
+    data object Generating : PairingCodeUiState
+    data class Ready(val code: PairingCode, val syncedToCloud: Boolean) : PairingCodeUiState
+    data class Error(val message: String) : PairingCodeUiState
+}
+
 @OptIn(ExperimentalCoroutinesApi::class)
 class MainViewModel(
     private val appContext: Context,
@@ -97,6 +106,11 @@ class MainViewModel(
     val localSettings: StateFlow<LocalAppSettings> = prefs.settingsFlow
         .stateIn(viewModelScope, SharingStarted.Eagerly, LocalAppSettings())
 
+    private val _connectionStatusMessage = MutableStateFlow<String?>(null)
+    val connectionStatusMessage: StateFlow<String?> = _connectionStatusMessage.asStateFlow()
+
+    private val _manualRetryTrigger = MutableStateFlow(0)
+
     val userProfileState: StateFlow<UiState<UserProfile?>> = familyRepo.observeUserProfile(currentUserId)
         .map<UserProfile?, UiState<UserProfile?>> { UiState.Success(it) }
         .catch { err ->
@@ -106,18 +120,71 @@ class MainViewModel(
         }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000L), UiState.Loading)
 
-    val familiesState: StateFlow<UiState<List<FamilyGroup>>> = familyRepo.observeMyFamilies(currentUserId)
-        .map<List<FamilyGroup>, UiState<List<FamilyGroup>>> { UiState.Success(it) }
-        .catch { err ->
-            val root = unwrapFirestoreError(err)
-            Log.w(TAG, "Families observe error", root)
-            emit(UiState.Error(root.message ?: "Failed to load family"))
-        }
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000L), UiState.Loading)
+    private val familiesSnapshotState: StateFlow<UiState<com.example.data.remote.FamilyQuerySnapshot>> =
+        _manualRetryTrigger
+            .flatMapLatest {
+                familyRepo.observeMyFamiliesWithMetadata(
+                    userId = currentUserId,
+                    onTransientError = {
+                        _connectionStatusMessage.value = "Connection unstable — using cached data & reconnecting..."
+                    },
+                    onRecovered = {
+                        _connectionStatusMessage.value = null
+                    }
+                )
+                    .map<com.example.data.remote.FamilyQuerySnapshot, UiState<com.example.data.remote.FamilyQuerySnapshot>> {
+                        UiState.Success(it)
+                    }
+                    .catch { err ->
+                        val root = unwrapFirestoreError(err)
+                        Log.w(TAG, "Families observe error", root)
+                        emit(UiState.Error(root.message ?: "Failed to connect to family database"))
+                    }
+            }
+            .stateIn(viewModelScope, SharingStarted.Eagerly, UiState.Loading)
 
-    val activeFamily: StateFlow<FamilyGroup?> = familiesState
-        .map { state -> (state as? UiState.Success)?.data?.firstOrNull() }
-        .stateIn(viewModelScope, SharingStarted.Eagerly, null)
+    val familiesState: StateFlow<UiState<List<FamilyGroup>>> = familiesSnapshotState
+        .map { state ->
+            when (state) {
+                is UiState.Loading -> UiState.Loading
+                is UiState.Error -> UiState.Error(state.message)
+                is UiState.Success -> UiState.Success(state.data.families)
+            }
+        }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, UiState.Loading)
+
+    val activeFamily: StateFlow<FamilyGroup?> = combine(familiesSnapshotState, localSettings) { state, s ->
+        val cachedFallback = if (
+            s.activeFamilyId.isNotBlank() &&
+            s.activeAdminUid.isNotBlank() &&
+            (s.selectedRole != "ADMIN" || isAllowedAdminEmail)
+        ) {
+            FamilyGroup(
+                id = s.activeFamilyId,
+                adminUid = s.activeAdminUid,
+                adminEmail = if (s.selectedRole == "ADMIN") currentUserEmail else null,
+                name = s.activeFamilyName.ifBlank { "My Family" },
+                memberUids = listOf(currentUserId)
+            )
+        } else {
+            null
+        }
+
+        when (state) {
+            is UiState.Success -> {
+                val live = state.data.families.firstOrNull()
+                if (live != null) {
+                    live
+                } else if (state.data.isFromCache && cachedFallback != null) {
+                    // Empty offline cache must NEVER evict an already-paired Admin or Family device
+                    cachedFallback
+                } else {
+                    null
+                }
+            }
+            is UiState.Loading, is UiState.Error -> cachedFallback
+        }
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, null)
 
     val isBackendAdmin: StateFlow<Boolean> = activeFamily
         .map { it != null && it.adminUid == currentUserId && isAllowedAdminEmail }
@@ -455,6 +522,9 @@ class MainViewModel(
     private val _latestGeneratedCode = MutableStateFlow<PairingCode?>(null)
     val latestGeneratedCode: StateFlow<PairingCode?> = _latestGeneratedCode.asStateFlow()
 
+    private val _pairingCodeUiState = MutableStateFlow<PairingCodeUiState>(PairingCodeUiState.Idle)
+    val pairingCodeUiState: StateFlow<PairingCodeUiState> = _pairingCodeUiState.asStateFlow()
+
     private val _pendingConsentAfterJoin = MutableStateFlow(false)
     val pendingConsentAfterJoin: StateFlow<Boolean> = _pendingConsentAfterJoin.asStateFlow()
 
@@ -486,7 +556,7 @@ class MainViewModel(
             activeFamily.collect { fam ->
                 if (fam != null) {
                     val role = if (fam.adminUid == currentUserId && isAllowedAdminEmail) "ADMIN" else "FAMILY"
-                    prefs.setSessionPairing(role = role, familyId = fam.id, adminUid = fam.adminUid)
+                    prefs.setSessionPairing(role = role, familyId = fam.id, adminUid = fam.adminUid, familyName = fam.name)
                     familyRepo.ensureGroupConversationMember(fam.id, fam.memberUids)
                     val cur = localSettings.value
                     SyncScheduler.schedulePeriodicSync(appContext, intervalMinutes = cur.locationIntervalMinutes)
@@ -634,6 +704,11 @@ class MainViewModel(
         _actionBanner.value = null
     }
 
+    fun retryFamilyConnection() {
+        _connectionStatusMessage.value = "Reconnecting..."
+        _manualRetryTrigger.value += 1
+    }
+
     fun setLanguage(lang: String) {
         viewModelScope.launch {
             prefs.setLanguage(lang)
@@ -668,7 +743,7 @@ class MainViewModel(
             val res = familyRepo.createFamilyAsAdmin(familyName, deviceId, lang)
             _isBusy.value = false
             res.onSuccess { fam ->
-                prefs.setSessionPairing("ADMIN", fam.id, fam.adminUid)
+                prefs.setSessionPairing("ADMIN", fam.id, fam.adminUid, fam.name)
                 _pendingConsentAfterJoin.value = true
             }.onFailure { err ->
                 _actionBanner.value = err.localizedMessage ?: "Failed to create family group"
@@ -933,14 +1008,82 @@ class MainViewModel(
 
     fun generatePairingCode() {
         viewModelScope.launch {
-            val fam = activeFamily.value ?: return@launch
+            val attemptId = QrDiagnosticLogger.newAttemptId()
+            val s = localSettings.value
+            val famId = activeFamily.value?.id ?: s.activeFamilyId
+            val famName = activeFamily.value?.name?.ifBlank { null }
+                ?: s.activeFamilyName.ifBlank { "My Family" }
+            QrDiagnosticLogger.logStage(
+                attemptId = attemptId,
+                stage = QrDiagnosticStage.CODE_REQUEST_START,
+                status = "OK",
+                message = "Requested pairing code for familyId='${famId.ifBlank { "<empty>" }}'"
+            )
+            if (famId.isBlank()) {
+                val msg = "Family group is still loading. Check internet connection and tap Retry."
+                QrDiagnosticLogger.logStage(
+                    attemptId = attemptId,
+                    stage = QrDiagnosticStage.ERROR,
+                    status = "FAIL",
+                    message = msg
+                )
+                _pairingCodeUiState.value = PairingCodeUiState.Error(msg)
+                _actionBanner.value = msg
+                return@launch
+            }
             _isBusy.value = true
-            val res = familyRepo.generatePairingCode(fam.id, fam.name)
+            _pairingCodeUiState.value = PairingCodeUiState.Generating
+            val res = familyRepo.generatePairingCodeWithStatus(
+                familyId = famId,
+                familyName = famName,
+                attemptId = attemptId,
+                fallbackAdminUid = if (isAllowedAdminEmail) currentUserId else ""
+            )
             _isBusy.value = false
-            res.onSuccess { code ->
-                _latestGeneratedCode.value = code
+            res.onSuccess { outcome ->
+                _latestGeneratedCode.value = outcome.pairingCode
+                _pairingCodeUiState.value = PairingCodeUiState.Ready(
+                    code = outcome.pairingCode,
+                    syncedToCloud = outcome.syncedToCloud
+                )
+                outcome.pendingWriteTask?.addOnCompleteListener { task ->
+                    val cur = _pairingCodeUiState.value
+                    if (task.isSuccessful) {
+                        QrDiagnosticLogger.logStage(
+                            attemptId = attemptId,
+                            stage = QrDiagnosticStage.FIRESTORE_WRITE_RESULT,
+                            status = "OK",
+                            message = "Delayed cloud ACK completed for ${outcome.pairingCode.code}"
+                        )
+                        if (cur is PairingCodeUiState.Ready && cur.code.code == outcome.pairingCode.code) {
+                            _pairingCodeUiState.value = cur.copy(syncedToCloud = true)
+                        }
+                    } else {
+                        val errMsg = task.exception?.localizedMessage ?: "Cloud sync failed for pairing code"
+                        QrDiagnosticLogger.logStage(
+                            attemptId = attemptId,
+                            stage = QrDiagnosticStage.ERROR,
+                            status = "FAIL",
+                            message = "Delayed pairing code upload failed: $errMsg",
+                            error = task.exception
+                        )
+                        Log.w(TAG, "Delayed pairing code upload error", task.exception)
+                        if (cur is PairingCodeUiState.Ready && cur.code.code == outcome.pairingCode.code) {
+                            _pairingCodeUiState.value = PairingCodeUiState.Error(errMsg)
+                        }
+                    }
+                }
             }.onFailure { err ->
-                _actionBanner.value = err.localizedMessage ?: "Failed to generate pairing code"
+                val msg = err.localizedMessage ?: "Failed to generate pairing code. Please try again."
+                QrDiagnosticLogger.logStage(
+                    attemptId = attemptId,
+                    stage = QrDiagnosticStage.ERROR,
+                    status = "FAIL",
+                    message = msg,
+                    error = err
+                )
+                _pairingCodeUiState.value = PairingCodeUiState.Error(msg)
+                _actionBanner.value = msg
             }
         }
     }

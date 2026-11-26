@@ -9,6 +9,8 @@ import com.example.data.model.LocationRecord
 import com.example.data.model.PairedDevice
 import com.example.data.model.PairingCode
 import com.example.data.model.UserProfile
+import com.example.service.QrDiagnosticLogger
+import com.example.service.QrDiagnosticStage
 import com.google.firebase.Firebase
 import com.google.firebase.Timestamp
 import com.google.firebase.auth.FirebaseAuth
@@ -16,6 +18,7 @@ import com.google.firebase.auth.auth
 import com.google.firebase.firestore.DocumentSnapshot
 import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.MetadataChanges
 import com.google.firebase.firestore.snapshots
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
@@ -24,9 +27,21 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.tasks.await
+import kotlinx.coroutines.withTimeoutOrNull
 import java.security.SecureRandom
 import java.util.Date
 import java.util.UUID
+
+data class PairingCodeGenerationOutcome(
+    val pairingCode: PairingCode,
+    val syncedToCloud: Boolean,
+    val pendingWriteTask: com.google.android.gms.tasks.Task<Void>? = null
+)
+
+data class FamilyQuerySnapshot(
+    val families: List<FamilyGroup>,
+    val isFromCache: Boolean
+)
 
 class FamilyRepository(
     private val db: FirebaseFirestore,
@@ -111,14 +126,35 @@ class FamilyRepository(
         }
     }
 
-    fun observeMyFamilies(userId: String): Flow<List<FamilyGroup>> = flow {
+    fun observeMyFamilies(
+        userId: String,
+        onTransientError: ((Throwable) -> Unit)? = null,
+        onRecovered: (() -> Unit)? = null
+    ): Flow<List<FamilyGroup>> = observeMyFamiliesWithMetadata(userId, onTransientError, onRecovered)
+        .map { it.families }
+
+    fun observeMyFamiliesWithMetadata(
+        userId: String,
+        onTransientError: ((Throwable) -> Unit)? = null,
+        onRecovered: (() -> Unit)? = null
+    ): Flow<FamilyQuerySnapshot> = flow {
         require(userId.isNotBlank())
         val path = "families"
         emitAll(
             db.collection(path)
                 .whereArrayContains("memberUids", userId)
-                .snapshots()
-                .map { snap -> snap.toObjects(FamilyGroup::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE) }
+                .snapshots(MetadataChanges.INCLUDE)
+                .map { snap ->
+                    FamilyQuerySnapshot(
+                        families = snap.toObjects(FamilyGroup::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE),
+                        isFromCache = snap.metadata.isFromCache
+                    )
+                }
+                .retryTransientFirestore(
+                    tag = "ObserveFamilies",
+                    onTransientError = onTransientError,
+                    onRecovered = onRecovered
+                )
                 .catch { error ->
                     val unwrapped = unwrapFirestoreError(error)
                     if (auth.currentUser?.uid == userId) {
@@ -235,11 +271,48 @@ class FamilyRepository(
     }
 
     suspend fun generatePairingCode(familyId: String, familyName: String): Result<PairingCode> {
-        val uid = try {
+        return generatePairingCodeWithStatus(familyId, familyName).map { it.pairingCode }
+    }
+
+    suspend fun generatePairingCodeWithStatus(
+        familyId: String,
+        familyName: String,
+        serverAckTimeoutMs: Long = 6_000L,
+        attemptId: String = QrDiagnosticLogger.newAttemptId(),
+        fallbackAdminUid: String = ""
+    ): Result<PairingCodeGenerationOutcome> {
+        val liveUid = auth.currentUser?.uid
+        val uid = liveUid ?: fallbackAdminUid.takeIf { it.isNotBlank() } ?: try {
             requireUserId()
         } catch (e: Exception) {
+            QrDiagnosticLogger.logStage(
+                attemptId = attemptId,
+                stage = QrDiagnosticStage.AUTH_AND_FAMILY_CHECK,
+                status = "FAIL",
+                message = "No active Firebase user for pairing code creation",
+                error = e
+            )
             return Result.failure(e)
         }
+        if (familyId.isBlank()) {
+            val err = IllegalStateException("Family session is not ready yet. Please retry.")
+            QrDiagnosticLogger.logStage(
+                attemptId = attemptId,
+                stage = QrDiagnosticStage.AUTH_AND_FAMILY_CHECK,
+                status = "FAIL",
+                message = err.message ?: "Blank familyId",
+                error = err
+            )
+            return Result.failure(err)
+        }
+        QrDiagnosticLogger.logStage(
+            attemptId = attemptId,
+            stage = QrDiagnosticStage.AUTH_AND_FAMILY_CHECK,
+            status = if (liveUid != null) "OK" else "WARN",
+            message = "familyId=$familyId, liveFirebaseAuth=${liveUid != null}"
+        )
+
+        val cleanFamilyName = familyName.trim().ifBlank { "My Family" }.take(80)
         val alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
         val codeBuilder = StringBuilder("FT")
         repeat(6) { codeBuilder.append(alphabet[random.nextInt(alphabet.length)]) }
@@ -252,26 +325,61 @@ class FamilyRepository(
                 "code" to code,
                 "familyId" to familyId,
                 "adminUid" to uid,
-                "familyName" to familyName.take(80),
+                "familyName" to cleanFamilyName,
                 "status" to "ACTIVE",
                 "expiresAt" to expiresAt,
                 "createdAt" to FieldValue.serverTimestamp()
             )
-            docRef.set(payload).await()
+            val startMs = android.os.SystemClock.elapsedRealtime()
+            QrDiagnosticLogger.logStage(
+                attemptId = attemptId,
+                stage = QrDiagnosticStage.FIRESTORE_WRITE_START,
+                status = "OK",
+                message = "Writing pairing_codes/$code"
+            )
+            val writeTask = docRef.set(payload)
+            val syncedWithinTimeout = withTimeoutOrNull(serverAckTimeoutMs) {
+                writeTask.await()
+                true
+            } == true
+            val elapsedMs = android.os.SystemClock.elapsedRealtime() - startMs
+            QrDiagnosticLogger.logStage(
+                attemptId = attemptId,
+                stage = QrDiagnosticStage.FIRESTORE_WRITE_RESULT,
+                status = if (syncedWithinTimeout) "OK" else "WARN",
+                message = if (syncedWithinTimeout) {
+                    "Cloud ACK received for $code"
+                } else {
+                    "Cloud ACK timed out after ${serverAckTimeoutMs}ms; keeping offline-queued code $code"
+                },
+                durationMs = elapsedMs
+            )
+            val model = PairingCode(
+                id = code,
+                code = code,
+                familyId = familyId,
+                adminUid = uid,
+                familyName = cleanFamilyName,
+                status = "ACTIVE",
+                expiresAt = expiresAt
+            )
             Result.success(
-                PairingCode(
-                    id = code,
-                    code = code,
-                    familyId = familyId,
-                    adminUid = uid,
-                    familyName = familyName,
-                    status = "ACTIVE",
-                    expiresAt = expiresAt
+                PairingCodeGenerationOutcome(
+                    pairingCode = model,
+                    syncedToCloud = syncedWithinTimeout,
+                    pendingWriteTask = if (syncedWithinTimeout) null else writeTask
                 )
             )
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
+            QrDiagnosticLogger.logStage(
+                attemptId = attemptId,
+                stage = QrDiagnosticStage.ERROR,
+                status = "FAIL",
+                message = "Firestore pairing_codes write failed: ${e.message ?: e.javaClass.simpleName}",
+                error = e
+            )
             handleFirestoreError(e, OperationType.CREATE, docRef.path)
             Result.failure(e)
         }
@@ -284,6 +392,7 @@ class FamilyRepository(
                 .whereEqualTo("adminUid", adminUid)
                 .snapshots()
                 .map { snap -> snap.toObjects(PairingCode::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE) }
+                .retryTransientFirestore("ObservePairingCodes")
                 .catch { error ->
                     val unwrapped = unwrapFirestoreError(error)
                     if (auth.currentUser?.uid == adminUid) {
@@ -415,6 +524,7 @@ class FamilyRepository(
             db.collection("families").document(familyId).collection("members")
                 .snapshots()
                 .map { snap -> snap.toObjects(FamilyMember::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE) }
+                .retryTransientFirestore("ObserveMembers")
                 .catch { error ->
                     val unwrapped = unwrapFirestoreError(error)
                     if (auth.currentUser != null) {
@@ -433,6 +543,7 @@ class FamilyRepository(
                 .whereEqualTo("adminUid", adminUid)
                 .snapshots()
                 .map { snap -> snap.toObjects(PairedDevice::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE) }
+                .retryTransientFirestore("ObserveAdminDevices")
                 .catch { error ->
                     val unwrapped = unwrapFirestoreError(error)
                     if (auth.currentUser?.uid == adminUid) {
@@ -451,6 +562,7 @@ class FamilyRepository(
                 .whereEqualTo("ownerUid", ownerUid)
                 .snapshots()
                 .map { snap -> snap.toObjects(PairedDevice::class.java, DocumentSnapshot.ServerTimestampBehavior.ESTIMATE) }
+                .retryTransientFirestore("ObserveOwnDevice")
                 .catch { error ->
                     val unwrapped = unwrapFirestoreError(error)
                     if (auth.currentUser?.uid == ownerUid) {
@@ -699,6 +811,7 @@ class FamilyRepository(
                         .filter { it.recordedAtMs >= sevenDaysAgoMs }
                         .sortedBy { it.recordedAtMs }
                 }
+                .retryTransientFirestore("ObserveLocationHistory")
                 .catch { error ->
                     val unwrapped = unwrapFirestoreError(error)
                     if (auth.currentUser?.uid == adminUid) {

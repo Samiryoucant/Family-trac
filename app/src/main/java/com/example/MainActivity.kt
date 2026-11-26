@@ -4,16 +4,24 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.CalendarMonth
 import androidx.compose.material.icons.filled.Call
+import androidx.compose.material.icons.filled.CloudOff
 import androidx.compose.material.icons.filled.Dashboard
 import androidx.compose.material.icons.filled.Devices
 import androidx.compose.material.icons.filled.GraphicEq
@@ -22,12 +30,15 @@ import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Map
 import androidx.compose.material.icons.filled.MoreHoriz
 import androidx.compose.material.icons.filled.Notifications
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Timeline
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
+import androidx.compose.material3.Button
+import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -39,13 +50,15 @@ import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationRail
 import androidx.compose.material3.NavigationRailItem
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
@@ -74,6 +87,7 @@ import com.example.data.local.FamilyTrackDatabase
 import com.example.data.remote.AuthHelper
 import com.example.data.remote.CommunicationRepository
 import com.example.data.remote.FamilyRepository
+import com.example.data.remote.ResilientAuthSession
 import com.example.service.NearbyCommunicationManager
 import com.example.service.VoiceRecorderPlayer
 import com.example.service.WebRtcCallManager
@@ -98,7 +112,6 @@ import com.example.ui.theme.FamilyTrackTheme
 import com.example.ui.viewmodel.MainViewModel
 import com.example.ui.viewmodel.UiState
 import com.google.firebase.Firebase
-import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.auth
 import com.google.firebase.firestore.FirebaseFirestore
 import kotlinx.coroutines.launch
@@ -143,24 +156,30 @@ fun AppRoot() {
     val prefs = remember(context) { AppPreferences(context.applicationContext) }
     val settings by prefs.settingsFlow.collectAsStateWithLifecycle(initialValue = com.example.data.local.LocalAppSettings())
 
-    var currentUser by remember { mutableStateOf(Firebase.auth.currentUser) }
+    val initialLiveUser = remember { Firebase.auth.currentUser }
+    val authSession by remember(context, prefs) {
+        AuthHelper.observeResilientAuthSession(context.applicationContext, prefs, Firebase.auth)
+    }.collectAsStateWithLifecycle(
+        initialValue = ResilientAuthSession(
+            uid = initialLiveUser?.uid,
+            email = initialLiveUser?.email.orEmpty()
+        )
+    )
+    var autoSignInTriggered by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val credentialManager = remember(context) { CredentialManager.create(context) }
 
-    DisposableEffect(Unit) {
-        val listener = FirebaseAuth.AuthStateListener { auth ->
-            currentUser = auth.currentUser
-        }
-        Firebase.auth.addAuthStateListener(listener)
-        onDispose { Firebase.auth.removeAuthStateListener(listener) }
-    }
-
     LaunchedEffect(Unit) {
-        if (Firebase.auth.currentUser == null) {
+        if (!autoSignInTriggered && Firebase.auth.currentUser == null) {
+            autoSignInTriggered = true
             AuthHelper.attemptAutoSignIn(
                 context = context,
                 credentialManager = credentialManager,
-                onAuthSuccess = { currentUser = Firebase.auth.currentUser },
+                onAuthSuccess = {
+                    Firebase.auth.currentUser?.let { u ->
+                        scope.launch { prefs.setAuthenticatedUserSession(u.uid, u.email.orEmpty()) }
+                    }
+                },
                 onUnauthenticated = {},
                 scope = scope
             )
@@ -168,21 +187,28 @@ fun AppRoot() {
     }
 
     FamilyTrackTheme(themePreference = settings.themePreference) {
-        val user = currentUser
-        if (user == null) {
+        val uid = authSession.uid
+        if (uid.isNullOrBlank()) {
             AuthScreen(
                 language = settings.language,
                 onToggleLanguage = {
                     val next = if (settings.language == "bn") "en" else "bn"
                     scope.launch { prefs.setLanguage(next) }
                 },
-                onAuthSuccess = { currentUser = Firebase.auth.currentUser }
+                onAuthSuccess = {
+                    Firebase.auth.currentUser?.let { u ->
+                        scope.launch { prefs.setAuthenticatedUserSession(u.uid, u.email.orEmpty()) }
+                    }
+                }
             )
         } else {
-            val uid = user.uid
-            val email = user.email.orEmpty()
+            val email = authSession.email
             key(uid) {
-                AuthenticatedAppHost(currentUserId = uid, currentUserEmail = email)
+                AuthenticatedAppHost(
+                    currentUserId = uid,
+                    currentUserEmail = email,
+                    authConnectivityNotice = authSession.connectivityNotice
+                )
             }
         }
     }
@@ -190,7 +216,11 @@ fun AppRoot() {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun AuthenticatedAppHost(currentUserId: String, currentUserEmail: String) {
+fun AuthenticatedAppHost(
+    currentUserId: String,
+    currentUserEmail: String,
+    authConnectivityNotice: String? = null
+) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val credentialManager = remember(context) { CredentialManager.create(context) }
@@ -225,6 +255,8 @@ fun AuthenticatedAppHost(currentUserId: String, currentUserEmail: String) {
     val pendingConsent by viewModel.pendingConsentAfterJoin.collectAsStateWithLifecycle()
     val isBusy by viewModel.isBusy.collectAsStateWithLifecycle()
     val banner by viewModel.actionBanner.collectAsStateWithLifecycle()
+    val connectionStatusMsg by viewModel.connectionStatusMessage.collectAsStateWithLifecycle()
+    val pairingCodeUiState by viewModel.pairingCodeUiState.collectAsStateWithLifecycle()
 
     val strings = stringsFor(settings.language)
     val snackbarHostState = remember { SnackbarHostState() }
@@ -237,28 +269,80 @@ fun AuthenticatedAppHost(currentUserId: String, currentUserEmail: String) {
         }
     }
 
-    when (familiesState) {
-        is UiState.Loading -> {
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                CircularProgressIndicator()
+    val family = activeFamily
+    if (family == null) {
+        when (familiesState) {
+            is UiState.Loading -> {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        CircularProgressIndicator()
+                        Text(
+                            text = connectionStatusMsg ?: "Loading your family workspace...",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
             }
-        }
-        is UiState.Error -> {
-            val errMsg = (familiesState as UiState.Error).message
-            OnboardingRoleScreen(
-                language = settings.language,
-                allowedAdminEmail = viewModel.isAllowedAdminEmail,
-                signedInEmail = currentUserEmail,
-                isBusy = isBusy,
-                bannerError = errMsg,
-                onClearError = {},
-                onCreateFamily = viewModel::createFamilyAsAdmin,
-                onJoinFamily = viewModel::joinFamilyWithCode
-            )
-        }
-        is UiState.Success -> {
-            val family = activeFamily
-            if (family == null) {
+            is UiState.Error -> {
+                val errMsg = (familiesState as UiState.Error).message
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(24.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Card(modifier = Modifier.fillMaxWidth()) {
+                        Column(
+                            modifier = Modifier.padding(20.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            Icon(
+                                Icons.Default.CloudOff,
+                                contentDescription = "Connection error",
+                                tint = MaterialTheme.colorScheme.error,
+                                modifier = Modifier.size(40.dp)
+                            )
+                            Text(
+                                text = "Connection Error",
+                                style = MaterialTheme.typography.titleLarge
+                            )
+                            Text(
+                                text = errMsg.ifBlank { "Unable to reach family server. Check your internet connection." },
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Button(
+                                onClick = viewModel::retryFamilyConnection,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("retry_connection_button")
+                            ) {
+                                Icon(Icons.Default.Refresh, contentDescription = null)
+                                Spacer(Modifier.width(8.dp))
+                                Text("Retry Connection")
+                            }
+                            OutlinedButton(
+                                onClick = {
+                                    AuthHelper.signOut(
+                                        credentialManager = credentialManager,
+                                        scope = scope,
+                                        beforeAuthSignOut = { viewModel.prepareSignOut() }
+                                    )
+                                },
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("Sign Out")
+                            }
+                        }
+                    }
+                }
+            }
+            is UiState.Success -> {
                 OnboardingRoleScreen(
                     language = settings.language,
                     allowedAdminEmail = viewModel.isAllowedAdminEmail,
@@ -269,28 +353,30 @@ fun AuthenticatedAppHost(currentUserId: String, currentUserEmail: String) {
                     onCreateFamily = viewModel::createFamilyAsAdmin,
                     onJoinFamily = viewModel::joinFamilyWithCode
                 )
-            } else if (pendingConsent) {
-                ConsentAndPermissionsScreen(
-                    language = settings.language,
-                    isAdmin = isBackendAdmin,
-                    onAgreeAndStart = viewModel::grantConsentAndEnableSharing,
-                    onSkipLocation = viewModel::skipLocationSharingForNow,
-                    onAgreeAndStartWithOptions = { enableLoc, enableNet ->
-                        viewModel.grantConsentAndEnableSharing(enableLoc, enableNet)
-                    }
-                )
-            } else {
-                val members by viewModel.familyMembers.collectAsStateWithLifecycle()
-                val adminDevices by viewModel.effectiveAdminDevices.collectAsStateWithLifecycle()
-                val ownDevice by viewModel.ownDevice.collectAsStateWithLifecycle()
-                val sevenDayLocations by viewModel.sevenDayLocations.collectAsStateWithLifecycle()
-                val adminCoords by viewModel.adminCurrentLocation.collectAsStateWithLifecycle()
-                val pendingLocCount by viewModel.pendingLocationCount.collectAsStateWithLifecycle()
-                val pendingMsgCount by viewModel.pendingMessageCount.collectAsStateWithLifecycle()
-                val syncStatus by viewModel.syncStatus.collectAsStateWithLifecycle()
-                val latestCode by viewModel.latestGeneratedCode.collectAsStateWithLifecycle()
-                val consentLogs by viewModel.consentLogs.collectAsStateWithLifecycle()
-                val conversations by viewModel.conversations.collectAsStateWithLifecycle()
+            }
+        }
+    } else if (pendingConsent) {
+        ConsentAndPermissionsScreen(
+            language = settings.language,
+            isAdmin = isBackendAdmin,
+            onAgreeAndStart = viewModel::grantConsentAndEnableSharing,
+            onSkipLocation = viewModel::skipLocationSharingForNow,
+            onAgreeAndStartWithOptions = { enableLoc, enableNet ->
+                viewModel.grantConsentAndEnableSharing(enableLoc, enableNet)
+            }
+        )
+    } else {
+        val members by viewModel.familyMembers.collectAsStateWithLifecycle()
+        val adminDevices by viewModel.effectiveAdminDevices.collectAsStateWithLifecycle()
+        val ownDevice by viewModel.ownDevice.collectAsStateWithLifecycle()
+        val sevenDayLocations by viewModel.sevenDayLocations.collectAsStateWithLifecycle()
+        val adminCoords by viewModel.adminCurrentLocation.collectAsStateWithLifecycle()
+        val pendingLocCount by viewModel.pendingLocationCount.collectAsStateWithLifecycle()
+        val pendingMsgCount by viewModel.pendingMessageCount.collectAsStateWithLifecycle()
+        val syncStatus by viewModel.syncStatus.collectAsStateWithLifecycle()
+        val latestCode by viewModel.latestGeneratedCode.collectAsStateWithLifecycle()
+        val consentLogs by viewModel.consentLogs.collectAsStateWithLifecycle()
+        val conversations by viewModel.conversations.collectAsStateWithLifecycle()
                 val selectedConvId by viewModel.selectedConversationId.collectAsStateWithLifecycle()
                 val messages by viewModel.activeMessages.collectAsStateWithLifecycle()
                 val pendingMessages by viewModel.pendingConversationMessages.collectAsStateWithLifecycle()
@@ -462,82 +548,127 @@ fun AuthenticatedAppHost(currentUserId: String, currentUserEmail: String) {
                             }
                         }
                     ) { innerPadding ->
-                        Row(
+                        Column(
                             modifier = Modifier
                                 .fillMaxSize()
                                 .padding(innerPadding)
                         ) {
-                            if (useRail) {
-                                NavigationRail {
-                                    allTabs.forEach { tab ->
-                                        NavigationRailItem(
-                                            selected = currentRoute == tab.route.route,
-                                            onClick = {
-                                                navController.navigate(tab.route.route) {
-                                                    popUpTo(startDestination) { saveState = true }
-                                                    launchSingleTop = true
-                                                    restoreState = true
-                                                }
-                                            },
-                                            icon = { Icon(tab.icon, contentDescription = tab.label) },
-                                            label = { Text(tab.label, maxLines = 1) }
+                            val statusMsg = connectionStatusMsg ?: authConnectivityNotice
+                            if (statusMsg != null) {
+                                Surface(
+                                    color = MaterialTheme.colorScheme.secondaryContainer,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .testTag("connection_status_banner")
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(horizontal = 14.dp, vertical = 6.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Icon(
+                                            Icons.Default.CloudOff,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                                            modifier = Modifier.size(18.dp)
                                         )
+                                        Spacer(Modifier.width(8.dp))
+                                        Text(
+                                            text = statusMsg,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        TextButton(
+                                            onClick = viewModel::retryFamilyConnection,
+                                            modifier = Modifier.testTag("connection_banner_retry")
+                                        ) {
+                                            Text("Retry")
+                                        }
                                     }
                                 }
                             }
-
-                            NavHost(
-                                navController = navController,
-                                startDestination = startDestination,
-                                modifier = Modifier.weight(1f)
+                            Row(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .fillMaxWidth()
                             ) {
-                                if (isBackendAdmin) {
-                                    composable(AppRoute.Dashboard.route) {
-                                        AdminDashboardScreen(
-                                            language = settings.language,
-                                            family = family,
-                                            devices = adminDevices,
-                                            adminCoordinates = adminCoords,
-                                            pendingLocCount = pendingLocCount,
-                                            syncStatus = syncStatus,
-                                            latestCode = latestCode,
-                                            isBusy = isBusy,
-                                            onlyDevicesList = false,
-                                            onGenerateCode = viewModel::generatePairingCode,
-                                            onSyncNow = viewModel::captureLocationAndQueueSync,
-                                            onRevokeDevice = viewModel::revokeDevice,
-                                            onRenameDevice = viewModel::renamePairedDevice,
-                                            onOpenNetworkHistory = {
-                                                navController.navigate(AppRoute.NetworkActivity.route) { launchSingleTop = true }
-                                            },
-                                            onOpenActivityCenter = {
-                                                navController.navigate(AppRoute.ActivityCenter.route) { launchSingleTop = true }
-                                            }
-                                        )
+                                if (useRail) {
+                                    NavigationRail {
+                                        allTabs.forEach { tab ->
+                                            NavigationRailItem(
+                                                selected = currentRoute == tab.route.route,
+                                                onClick = {
+                                                    navController.navigate(tab.route.route) {
+                                                        popUpTo(startDestination) { saveState = true }
+                                                        launchSingleTop = true
+                                                        restoreState = true
+                                                    }
+                                                },
+                                                icon = { Icon(tab.icon, contentDescription = tab.label) },
+                                                label = { Text(tab.label, maxLines = 1) }
+                                            )
+                                        }
                                     }
-                                    composable(AppRoute.Devices.route) {
-                                        AdminDashboardScreen(
-                                            language = settings.language,
-                                            family = family,
-                                            devices = adminDevices,
-                                            adminCoordinates = adminCoords,
-                                            pendingLocCount = pendingLocCount,
-                                            syncStatus = syncStatus,
-                                            latestCode = latestCode,
-                                            isBusy = isBusy,
-                                            onlyDevicesList = true,
-                                            onGenerateCode = viewModel::generatePairingCode,
-                                            onSyncNow = viewModel::captureLocationAndQueueSync,
-                                            onRevokeDevice = viewModel::revokeDevice,
-                                            onRenameDevice = viewModel::renamePairedDevice,
-                                            onOpenNetworkHistory = {
-                                                navController.navigate(AppRoute.NetworkActivity.route) { launchSingleTop = true }
-                                            },
-                                            onOpenActivityCenter = {
-                                                navController.navigate(AppRoute.ActivityCenter.route) { launchSingleTop = true }
-                                            }
-                                        )
-                                    }
+                                }
+
+                                NavHost(
+                                    navController = navController,
+                                    startDestination = startDestination,
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    if (isBackendAdmin) {
+                                        composable(AppRoute.Dashboard.route) {
+                                            AdminDashboardScreen(
+                                                language = settings.language,
+                                                family = family,
+                                                devices = adminDevices,
+                                                adminCoordinates = adminCoords,
+                                                pendingLocCount = pendingLocCount,
+                                                syncStatus = syncStatus,
+                                                latestCode = latestCode,
+                                                isBusy = isBusy,
+                                                onlyDevicesList = false,
+                                                onGenerateCode = viewModel::generatePairingCode,
+                                                onSyncNow = viewModel::captureLocationAndQueueSync,
+                                                onRevokeDevice = viewModel::revokeDevice,
+                                                onRenameDevice = viewModel::renamePairedDevice,
+                                                onOpenNetworkHistory = {
+                                                    navController.navigate(AppRoute.NetworkActivity.route) { launchSingleTop = true }
+                                                },
+                                                onOpenActivityCenter = {
+                                                    navController.navigate(AppRoute.ActivityCenter.route) { launchSingleTop = true }
+                                                },
+                                                pairingCodeUiState = pairingCodeUiState,
+                                                onRetryGenerateCode = viewModel::generatePairingCode
+                                            )
+                                        }
+                                        composable(AppRoute.Devices.route) {
+                                            AdminDashboardScreen(
+                                                language = settings.language,
+                                                family = family,
+                                                devices = adminDevices,
+                                                adminCoordinates = adminCoords,
+                                                pendingLocCount = pendingLocCount,
+                                                syncStatus = syncStatus,
+                                                latestCode = latestCode,
+                                                isBusy = isBusy,
+                                                onlyDevicesList = true,
+                                                onGenerateCode = viewModel::generatePairingCode,
+                                                onSyncNow = viewModel::captureLocationAndQueueSync,
+                                                onRevokeDevice = viewModel::revokeDevice,
+                                                onRenameDevice = viewModel::renamePairedDevice,
+                                                onOpenNetworkHistory = {
+                                                    navController.navigate(AppRoute.NetworkActivity.route) { launchSingleTop = true }
+                                                },
+                                                onOpenActivityCenter = {
+                                                    navController.navigate(AppRoute.ActivityCenter.route) { launchSingleTop = true }
+                                                },
+                                                pairingCodeUiState = pairingCodeUiState,
+                                                onRetryGenerateCode = viewModel::generatePairingCode
+                                            )
+                                        }
                                     composable(AppRoute.LiveMap.route) {
                                         AdminMapScreen(
                                             language = settings.language,
@@ -776,10 +907,9 @@ fun AuthenticatedAppHost(currentUserId: String, currentUserEmail: String) {
                                 }
                             }
                         }
+                        }
                     }
-                }
                 }
             }
         }
     }
-}

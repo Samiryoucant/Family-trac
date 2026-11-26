@@ -21,8 +21,11 @@ data class LocalAppSettings(
     val deviceId: String = "",
     val language: String = "en",
     val themePreference: ThemePreference = ThemePreference.SYSTEM,
+    val cachedUserUid: String = "",
+    val cachedUserEmail: String = "",
     val selectedRole: String = "",
     val activeFamilyId: String = "",
+    val activeFamilyName: String = "",
     val activeAdminUid: String = "",
     val consentGranted: Boolean = false,
     val locationSharingEnabled: Boolean = false,
@@ -42,8 +45,11 @@ class AppPreferences(private val context: Context) {
         val DEVICE_ID = stringPreferencesKey("device_id")
         val LANGUAGE = stringPreferencesKey("language")
         val THEME = stringPreferencesKey("theme")
+        val CACHED_USER_UID = stringPreferencesKey("cached_user_uid")
+        val CACHED_USER_EMAIL = stringPreferencesKey("cached_user_email")
         val SELECTED_ROLE = stringPreferencesKey("selected_role")
         val ACTIVE_FAMILY_ID = stringPreferencesKey("active_family_id")
+        val ACTIVE_FAMILY_NAME = stringPreferencesKey("active_family_name")
         val ACTIVE_ADMIN_UID = stringPreferencesKey("active_admin_uid")
         val CONSENT_GRANTED = booleanPreferencesKey("consent_granted")
         val LOCATION_SHARING_ENABLED = booleanPreferencesKey("location_sharing_enabled")
@@ -66,8 +72,11 @@ class AppPreferences(private val context: Context) {
             deviceId = prefs[Keys.DEVICE_ID] ?: "",
             language = prefs[Keys.LANGUAGE] ?: "en",
             themePreference = theme,
+            cachedUserUid = prefs[Keys.CACHED_USER_UID] ?: "",
+            cachedUserEmail = prefs[Keys.CACHED_USER_EMAIL] ?: "",
             selectedRole = prefs[Keys.SELECTED_ROLE] ?: "",
             activeFamilyId = prefs[Keys.ACTIVE_FAMILY_ID] ?: "",
+            activeFamilyName = prefs[Keys.ACTIVE_FAMILY_NAME] ?: "",
             activeAdminUid = prefs[Keys.ACTIVE_ADMIN_UID] ?: "",
             consentGranted = prefs[Keys.CONSENT_GRANTED] ?: false,
             locationSharingEnabled = prefs[Keys.LOCATION_SHARING_ENABLED] ?: false,
@@ -99,15 +108,29 @@ class AppPreferences(private val context: Context) {
         context.dataStore.edit { it[Keys.THEME] = theme.name }
     }
 
+    suspend fun setAuthenticatedUserSession(uid: String, email: String) {
+        if (uid.isBlank()) return
+        context.dataStore.edit {
+            it[Keys.CACHED_USER_UID] = uid
+            if (email.isNotBlank()) {
+                it[Keys.CACHED_USER_EMAIL] = email
+            }
+        }
+    }
+
     suspend fun setSessionPairing(
         role: String,
         familyId: String,
-        adminUid: String
+        adminUid: String,
+        familyName: String = ""
     ) {
         context.dataStore.edit {
             it[Keys.SELECTED_ROLE] = role
             it[Keys.ACTIVE_FAMILY_ID] = familyId
             it[Keys.ACTIVE_ADMIN_UID] = adminUid
+            if (familyName.isNotBlank()) {
+                it[Keys.ACTIVE_FAMILY_NAME] = familyName
+            }
         }
     }
 
@@ -161,8 +184,11 @@ class AppPreferences(private val context: Context) {
 
     suspend fun clearPairingOnSignOut() {
         context.dataStore.edit {
+            it.remove(Keys.CACHED_USER_UID)
+            it.remove(Keys.CACHED_USER_EMAIL)
             it.remove(Keys.SELECTED_ROLE)
             it.remove(Keys.ACTIVE_FAMILY_ID)
+            it.remove(Keys.ACTIVE_FAMILY_NAME)
             it.remove(Keys.ACTIVE_ADMIN_UID)
             it[Keys.LOCATION_SHARING_ENABLED] = false
             it[Keys.NETWORK_MONITORING_ENABLED] = false

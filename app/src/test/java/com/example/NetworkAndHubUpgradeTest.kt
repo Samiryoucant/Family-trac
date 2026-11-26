@@ -32,20 +32,34 @@ import com.example.data.model.LocationRecord
 import com.example.data.model.NetworkEventModel
 import com.example.data.model.NetworkSessionModel
 import com.example.data.model.PairedDevice
+import com.example.data.model.PairingCode
+import com.example.data.remote.AuthHelper
+import com.example.data.remote.isTransientFirestoreError
 import com.example.service.NetworkActivityMonitor
+import com.example.service.QRCodeDiagnosticService
+import com.example.service.QrCodeHelper
+import com.example.service.QrDiagnosticLogger
+import com.example.service.QrDiagnosticStage
 import com.example.service.VoiceRecorderPlayer
+import com.example.ui.screens.AdminDashboardScreen
 import com.example.ui.screens.DeviceActivityCenterScreen
 import com.example.ui.screens.FamilyHubScreen
 import com.example.ui.screens.GlobalSearchScreen
 import com.example.ui.screens.MessengerScreen
 import com.example.ui.screens.NetworkActivityScreen
 import com.example.ui.theme.FamilyTrackTheme
+import com.example.ui.viewmodel.PairingCodeUiState
 import com.example.ui.viewmodel.buildLocationHistoryCsv
 import com.example.ui.viewmodel.buildNetworkActivityCsv
 import com.example.ui.viewmodel.buildUnifiedDeviceTimeline
 import com.example.ui.viewmodel.computeExpenseCategoryTotals
 import com.example.ui.viewmodel.computeTicTacToeOnlineStats
 import com.example.ui.viewmodel.formatLastSeenForViewer
+import com.google.firebase.FirebaseNetworkException
+import com.google.firebase.auth.FirebaseAuthException
+import com.google.firebase.firestore.FirebaseFirestoreException
+import java.io.IOException
+import java.net.SocketTimeoutException
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
@@ -582,5 +596,184 @@ class NetworkAndHubUpgradeTest {
                 composeRule.onNodeWithText("DEVICE • Infinix SMART 9 HD").assertIsDisplayed()
             }.isSuccess
         )
+    }
+
+    @Test
+    fun transientFirestoreErrorClassifier_distinguishesNetworkDropsFromPermissions() {
+        assertTrue(
+            isTransientFirestoreError(
+                FirebaseFirestoreException("unavailable", FirebaseFirestoreException.Code.UNAVAILABLE)
+            )
+        )
+        assertTrue(
+            isTransientFirestoreError(
+                FirebaseFirestoreException("deadline exceeded", FirebaseFirestoreException.Code.DEADLINE_EXCEEDED)
+            )
+        )
+        assertTrue(isTransientFirestoreError(IOException("socket reset")))
+        assertFalse(
+            isTransientFirestoreError(
+                FirebaseFirestoreException("permission denied", FirebaseFirestoreException.Code.PERMISSION_DENIED)
+            )
+        )
+    }
+
+    @Test
+    fun adminDashboardQrDialog_displaysErrorRetryAndReadyStates() {
+        var retryClicks = 0
+        composeRule.setContent {
+            FamilyTrackTheme {
+                AdminDashboardScreen(
+                    language = "en",
+                    family = com.example.data.model.FamilyGroup(id = "fam_1", adminUid = "adm_1", name = "Rahman Family"),
+                    devices = emptyList(),
+                    adminCoordinates = null,
+                    pendingLocCount = 0,
+                    syncStatus = null,
+                    latestCode = null,
+                    isBusy = false,
+                    onlyDevicesList = true,
+                    onGenerateCode = {},
+                    onSyncNow = {},
+                    onRevokeDevice = {},
+                    pairingCodeUiState = PairingCodeUiState.Error("Network unavailable"),
+                    onRetryGenerateCode = { retryClicks++ }
+                )
+            }
+        }
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("devices_pair_qr_button").performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithText("Network unavailable").assertIsDisplayed()
+        composeRule.onNodeWithTag("qr_retry_button").performClick()
+        assertEquals(1, retryClicks)
+    }
+
+    @Test
+    fun adminDashboardQrDialog_rendersQrAndSyncStatusWhenReady() {
+        composeRule.setContent {
+            FamilyTrackTheme {
+                AdminDashboardScreen(
+                    language = "en",
+                    family = com.example.data.model.FamilyGroup(id = "fam_1", adminUid = "adm_1", name = "Rahman Family"),
+                    devices = emptyList(),
+                    adminCoordinates = null,
+                    pendingLocCount = 0,
+                    syncStatus = null,
+                    latestCode = null,
+                    isBusy = false,
+                    onlyDevicesList = true,
+                    onGenerateCode = {},
+                    onSyncNow = {},
+                    onRevokeDevice = {},
+                    pairingCodeUiState = PairingCodeUiState.Ready(
+                        code = PairingCode(id = "FT998877", code = "FT998877"),
+                        syncedToCloud = true
+                    )
+                )
+            }
+        }
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("devices_pair_qr_button").performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("pairing_qr_image").assertIsDisplayed()
+        composeRule.onNodeWithText("FT998877").assertIsDisplayed()
+        composeRule.onNodeWithText("Synced to cloud • Ready to scan").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithTag("qr_toggle_diagnostics_button").performScrollTo().performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("qr_diagnostic_log_text").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithTag("qr_run_selftest_button").performScrollTo().performClick()
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("qr_selftest_result_text").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithTag("qr_copy_diagnostics_button").performScrollTo().assertIsDisplayed()
+    }
+
+    @Test
+    fun qrCodeDiagnosticService_runsDummySelfTestAndLogsSpecificExceptions() {
+        QrDiagnosticLogger.clear()
+        val pass = QRCodeDiagnosticService.runSelfTest()
+        assertTrue(pass.passed)
+        assertEquals(256, pass.bitmapWidth)
+        assertNull(pass.errorType)
+
+        val emptyErr = QRCodeDiagnosticService.diagnoseGeneration(content = "  ", sizePx = 256)
+        assertFalse(emptyErr.passed)
+        assertEquals("IllegalArgumentException", emptyErr.errorType)
+        assertTrue(emptyErr.specificErrorMessage?.contains("IllegalArgumentException") == true)
+
+        val sizeErr = QRCodeDiagnosticService.diagnoseGeneration(content = "FAMILYTRACK:TEST1234", sizePx = 10)
+        assertFalse(sizeErr.passed)
+        assertEquals("IllegalArgumentException", sizeErr.errorType)
+        assertTrue(sizeErr.specificErrorMessage?.contains("out of supported range") == true)
+
+        val writerErr = QRCodeDiagnosticService.diagnoseGeneration(content = "A".repeat(8000), sizePx = 256)
+        assertFalse(writerErr.passed)
+        assertEquals("WriterException", writerErr.errorType)
+        assertTrue(writerErr.specificErrorMessage?.contains("WriterException") == true)
+    }
+
+    @Test
+    fun qrDiagnosticLogger_tracksSuccessAndFailureStages() {
+        QrDiagnosticLogger.clear()
+        val ok = QrCodeHelper.generateQrBitmapWithDiagnostics("FAMILYTRACK:FT123456", sizePx = 256, attemptId = "test_ok")
+        assertTrue(ok.bitmap != null)
+        assertNull(ok.errorMessage)
+        val okStages = QrDiagnosticLogger.getEntriesForAttempt("test_ok").map { it.stage }
+        assertTrue(okStages.contains(QrDiagnosticStage.PAYLOAD_VALIDATION))
+        assertTrue(okStages.contains(QrDiagnosticStage.MATRIX_ENCODE))
+        assertTrue(okStages.contains(QrDiagnosticStage.BITMAP_ALLOCATION))
+        assertTrue(okStages.contains(QrDiagnosticStage.RENDER_COMPLETE))
+
+        val emptyFail = QrCodeHelper.generateQrBitmapWithDiagnostics("   ", sizePx = 256, attemptId = "test_empty")
+        assertNull(emptyFail.bitmap)
+        assertTrue(emptyFail.errorMessage?.contains("empty") == true)
+        assertTrue(emptyFail.diagnosticReport.contains("PAYLOAD_VALIDATION -> FAIL"))
+
+        val sizeFail = QrCodeHelper.generateQrBitmapWithDiagnostics("FAMILYTRACK:FT123456", sizePx = 12, attemptId = "test_size")
+        assertNull(sizeFail.bitmap)
+        assertTrue(sizeFail.errorMessage?.contains("Invalid QR bitmap size") == true)
+    }
+
+    @Test
+    fun authHelper_connectivityExceptionsMaintainPersistedSession() {
+        assertTrue(AuthHelper.isConnectivityFirebaseException(FirebaseNetworkException("no network")))
+        assertTrue(AuthHelper.isConnectivityFirebaseException(SocketTimeoutException("read timed out")))
+        assertTrue(
+            AuthHelper.isConnectivityFirebaseException(
+                FirebaseFirestoreException("unavailable", FirebaseFirestoreException.Code.UNAVAILABLE)
+            )
+        )
+        assertFalse(
+            AuthHelper.isConnectivityFirebaseException(
+                FirebaseAuthException("ERROR_USER_DISABLED", "Account disabled")
+            )
+        )
+
+        // Temporary network drop must keep persisted session instead of returning null uid
+        val offlinePreserved = AuthHelper.resolveAuthStateDecision(
+            liveUid = null,
+            liveEmail = "",
+            cachedUid = "uid_admin_1",
+            cachedEmail = "quixoratech@gmail.com",
+            isExplicitSignOut = false,
+            isNetworkOnline = false,
+            encounteredConnectivityError = true
+        )
+        assertEquals("uid_admin_1", offlinePreserved.uid)
+        assertEquals("quixoratech@gmail.com", offlinePreserved.email)
+        assertTrue(offlinePreserved.isOfflineFallback)
+        assertTrue(offlinePreserved.connectivityNotice != null)
+
+        // Explicit sign out must clear session cleanly
+        val signedOut = AuthHelper.resolveAuthStateDecision(
+            liveUid = null,
+            liveEmail = "",
+            cachedUid = "uid_admin_1",
+            cachedEmail = "quixoratech@gmail.com",
+            isExplicitSignOut = true,
+            isNetworkOnline = false,
+            encounteredConnectivityError = false
+        )
+        assertNull(signedOut.uid)
     }
 }
